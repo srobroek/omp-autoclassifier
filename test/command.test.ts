@@ -48,12 +48,13 @@ interface Harness {
 	output: string[];
 	reloads: number;
 	setups: number;
+	calibrations: number;
 }
 
 function harness(options: { cfg?: Partial<EffectiveConfig>; entries?: DecisionRecord[]; role?: string } = {}): Harness {
 	const cfg = config(options.cfg);
 	const state = new GateState(cfg);
-	const result: Harness = { state, output: [], reloads: 0, setups: 0, deps: {} as CommandDeps };
+	const result: Harness = { state, output: [], reloads: 0, setups: 0, calibrations: 0, deps: {} as CommandDeps };
 	result.deps = {
 		config: () => cfg,
 		state,
@@ -67,6 +68,10 @@ function harness(options: { cfg?: Partial<EffectiveConfig>; entries?: DecisionRe
 		},
 		runSetup: async () => {
 			result.setups++;
+		},
+		runCalibration: async () => {
+			result.calibrations++;
+			return "accuracy 43/43";
 		},
 		print: text => {
 			result.output.push(text);

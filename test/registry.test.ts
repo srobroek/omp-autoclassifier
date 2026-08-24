@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { registerSession, reportChildDenial, unregisterSession } from "../src/registry";
+import { registerSession, reportChildDenial, requestParentEscalation, unregisterSession } from "../src/registry";
 
 const registered: string[] = [];
 
@@ -109,5 +109,129 @@ describe("cross-session denial reporting", () => {
 		register("parent", parent);
 		reportChildDenial("scout-42", "bash", "nope");
 		expect(parent[0]).toContain("scout-42");
+	});
+});
+
+/**
+ * A subagent is headless, so its own gate has nobody to ask. Rather than refusing outright it borrows the
+ * parent's UI through this same registry, which is the only cross-session channel omp exposes.
+ *
+ * The budget matters: omp bounds each `tool_call` handler by `extensionHandlers.toolCallTimeoutMs`
+ * (30s by default) and turns an overrun into a block. A prompt nobody answers therefore has to resolve
+ * into a denial well before that, or the block arrives with a confusing timeout reason instead of a
+ * decision.
+ */
+describe("escalating from a subagent to the parent", () => {
+	test("the parent is asked and its answer is returned", async () => {
+		registered.push("parent");
+		registerSession("parent", {
+			hasUI: true,
+			notify: () => {},
+			escalate: async () => "once",
+		});
+		expect(await requestParentEscalation("child-1", "bash", "risky", 1000)).toBe("once");
+	});
+
+	test("the parent sees the tool and the reason", async () => {
+		const asked: string[] = [];
+		registered.push("parent");
+		registerSession("parent", {
+			hasUI: true,
+			notify: () => {},
+			escalate: async (toolName, reason) => {
+				asked.push(`${toolName}|${reason}`);
+				return "deny";
+			},
+		});
+		await requestParentEscalation("child-1", "write", "Adds an SSH key.", 1000);
+		expect(asked[0]).toContain("write");
+		expect(asked[0]).toContain("Adds an SSH key.");
+	});
+
+	test("allowing for the session is passed through", async () => {
+		registered.push("parent");
+		registerSession("parent", { hasUI: true, notify: () => {}, escalate: async () => "session" });
+		expect(await requestParentEscalation("child-1", "bash", "risky", 1000)).toBe("session");
+	});
+
+	test("with no interactive session registered the answer is deny", async () => {
+		expect(await requestParentEscalation("child-1", "bash", "risky", 1000)).toBe("deny");
+	});
+
+	test("a headless session is never asked, since nobody would see the prompt", async () => {
+		let asked = false;
+		registered.push("other-child");
+		registerSession("other-child", {
+			hasUI: false,
+			notify: () => {},
+			escalate: async () => {
+				asked = true;
+				return "once";
+			},
+		});
+		expect(await requestParentEscalation("child-1", "bash", "risky", 1000)).toBe("deny");
+		expect(asked).toBe(false);
+	});
+
+	test("the child is never asked to approve its own call", async () => {
+		let asked = false;
+		registered.push("child-1");
+		registerSession("child-1", {
+			hasUI: true,
+			notify: () => {},
+			escalate: async () => {
+				asked = true;
+				return "once";
+			},
+		});
+		expect(await requestParentEscalation("child-1", "bash", "risky", 1000)).toBe("deny");
+		expect(asked).toBe(false);
+	});
+
+	test("an unanswered prompt resolves to deny inside the budget", async () => {
+		registered.push("parent");
+		registerSession("parent", {
+			hasUI: true,
+			notify: () => {},
+			escalate: () => Promise.withResolvers<never>().promise,
+		});
+		const started = Date.now();
+		expect(await requestParentEscalation("child-1", "bash", "risky", 120)).toBe("deny");
+		expect(Date.now() - started).toBeLessThan(2000);
+	});
+
+	test("a prompt that throws resolves to deny", async () => {
+		registered.push("parent");
+		registerSession("parent", {
+			hasUI: true,
+			notify: () => {},
+			escalate: async () => {
+				throw new Error("ui is gone");
+			},
+		});
+		expect(await requestParentEscalation("child-1", "bash", "risky", 1000)).toBe("deny");
+	});
+
+	test("a session without an escalate capability is skipped", async () => {
+		registered.push("plain");
+		registerSession("plain", { hasUI: true, notify: () => {} });
+		expect(await requestParentEscalation("child-1", "bash", "risky", 1000)).toBe("deny");
+	});
+
+	test("only one parent is asked, so two sessions do not both prompt", async () => {
+		let prompts = 0;
+		for (const id of ["parent-a", "parent-b"]) {
+			registered.push(id);
+			registerSession(id, {
+				hasUI: true,
+				notify: () => {},
+				escalate: async () => {
+					prompts++;
+					return "deny";
+				},
+			});
+		}
+		await requestParentEscalation("child-1", "bash", "risky", 1000);
+		expect(prompts).toBe(1);
 	});
 });

@@ -14,7 +14,12 @@
 interface SessionHooks {
 	hasUI: boolean;
 	notify: (message: string) => void;
+	/** Present only where a dialog can actually be shown. */
+	escalate?: (toolName: string, reason: string) => Promise<EscalationChoice>;
 }
+
+/** What the user chose at an escalation prompt. Mirrors the gate's own type. */
+export type EscalationChoice = "once" | "session" | "deny";
 
 const sessions = new Map<string, SessionHooks>();
 
@@ -39,7 +44,33 @@ export function reportChildDenial(childSessionId: string, toolName: string, reas
 	}
 }
 
-/** Test seam: drop every registration. */
-export function resetRegistry(): void {
-	sessions.clear();
+/**
+ * Ask an interactive session to decide a call a headless one cannot prompt about.
+ *
+ * This is the answer to "the subagent has nobody to ask": it borrows the parent's dialog. Only one
+ * session is asked, because two prompts for one call would be worse than none.
+ *
+ * `timeoutMs` has to stay well inside omp's `extensionHandlers.toolCallTimeoutMs` (30s by default),
+ * since overrunning that turns the call into a block with a timeout reason instead of a decision. An
+ * unanswered or broken prompt resolves to `deny`, so silence never reads as consent.
+ */
+export async function requestParentEscalation(
+	childSessionId: string,
+	toolName: string,
+	reason: string,
+	timeoutMs: number,
+): Promise<EscalationChoice> {
+	for (const [id, hooks] of sessions) {
+		if (id === childSessionId || !hooks.hasUI || hooks.escalate === undefined) continue;
+		const timeout = Promise.withResolvers<EscalationChoice>();
+		const timer = setTimeout(() => timeout.resolve("deny"), timeoutMs);
+		try {
+			return await Promise.race([hooks.escalate(toolName, reason), timeout.promise]);
+		} catch {
+			return "deny";
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+	return "deny";
 }

@@ -15,6 +15,8 @@
  *   - `ctx.modelRegistry.complete` and `.getProvider` do not exist on omp's registry. Calling them is
  *     the exact bug that makes `@czottmann/pi-automode` block every tool call on this host.
  */
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type {
 	ExtensionAPI,
@@ -27,11 +29,12 @@ import { VerdictCache } from "./cache";
 import { classify, CLASSIFIER_ROLE, type ClassifierDeps, type CompletionFn } from "./classifier";
 import { runCommand, subcommandNames, type SessionOverride } from "./command";
 import { ConfigStore, type ConfigPaths } from "./config";
-import { PLUGIN_NAME, STATE_ENTRY_TYPE } from "./defaults";
+import { CALIBRATE_ENV_VAR, PLUGIN_NAME, STATE_ENTRY_TYPE } from "./defaults";
 import { decide, type DecisionRecord, type EscalationChoice, type GateDeps } from "./gate";
 import { DecisionLog } from "./log";
-import { registerSession, reportChildDenial, unregisterSession } from "./registry";
+import { registerSession, reportChildDenial, requestParentEscalation, unregisterSession } from "./registry";
 import { GateState } from "./state";
+import { report, runCalibration } from "./calibrate";
 import { describeCandidate, rankCandidates, SKIP_LABEL, type WizardModel } from "./wizard";
 
 /** Resolved once per process: the host's own `complete`, via the scope shim. */
@@ -40,6 +43,30 @@ let completion: Promise<CompletionFn> | undefined;
 function loadCompletion(): Promise<CompletionFn> {
 	completion ??= import("@oh-my-pi/pi-ai").then(module => module.complete as unknown as CompletionFn);
 	return completion;
+}
+
+/**
+ * How long a subagent waits for a human at the parent's prompt.
+ *
+ * omp bounds each `tool_call` handler by `extensionHandlers.toolCallTimeoutMs` (30s by default) and turns
+ * an overrun into a block with a timeout reason. Staying well inside that budget means an unanswered
+ * prompt produces a real decision instead of a confusing timeout.
+ */
+const PARENT_PROMPT_TIMEOUT_MS = 15_000;
+
+/** The escalation dialog, shared by a session deciding for itself and one deciding for a subagent. */
+async function askUser(ctx: ExtensionContext, toolName: string, reason: string): Promise<EscalationChoice> {
+	const allowOnce = "Allow once";
+	const allowSession = "Allow for this session";
+	const choice = await ctx.ui.select(`autoclassifier: ${reason}`, [
+		{ label: allowOnce, description: `Run this ${toolName} call now.` },
+		{ label: "Deny", description: "Block the call and tell the agent why." },
+		{ label: allowSession, description: "Stop asking about this exact call for the rest of the session." },
+	]);
+	if (choice === allowOnce) return "once";
+	if (choice === allowSession) return "session";
+	// Cancelled, timed out, or unavailable: never read as consent.
+	return "deny";
 }
 
 function configPaths(agentDir: string, pluginsRoot: string, cwd: string): ConfigPaths {
@@ -210,12 +237,38 @@ export default function autoclassifier(pi: ExtensionAPI): void {
 		registerSession(registeredSessionId, {
 			hasUI: ctx.hasUI,
 			notify: message => ctx.ui.notify(message, "warning"),
+			// Lets a headless subagent borrow this session's dialog.
+			escalate: ctx.hasUI ? (toolName, reason) => askUser(ctx, toolName, reason) : undefined,
 		});
 		if (ctx.hasUI && classifierRole() === undefined) {
 			ctx.ui.notify(
 				"autoclassifier is installed but inactive: run `/autoclassifier setup` to choose a classifier model.",
 				"warning",
 			);
+		}
+
+		// Headless calibration hook. A slash command cannot be reached from a print-mode or CI session,
+		// and an agent cannot invoke one on its own, so tuning the classifier needs a trigger that works
+		// without a terminal. Writes the report to a file and leaves it there.
+		const calibrateTo = process.env[CALIBRATE_ENV_VAR];
+		if (calibrateTo !== undefined && calibrateTo.length > 0) {
+			const destination = calibrateTo === "1" ? path.join(agentDir, "autoclassifier", "calibration.txt") : calibrateTo;
+			try {
+				const results = await runCalibration({
+					configuredRole: classifierRole,
+					resolveModel: spec => ctx.models.resolve(spec),
+					resolveAuth: async model => ctx.modelRegistry.getApiKeyAndHeaders(model as Model),
+					complete: await loadCompletion(),
+				});
+				await fs.mkdir(path.dirname(destination), { recursive: true });
+				await fs.writeFile(destination, `${report(results)}\n`);
+				ctx.ui.notify(`autoclassifier calibration written to ${destination}`, "info");
+			} catch (error) {
+				ctx.ui.notify(
+					`autoclassifier calibration failed: ${error instanceof Error ? error.message : String(error)}`,
+					"error",
+				);
+			}
 		}
 	});
 
@@ -250,19 +303,9 @@ export default function autoclassifier(pi: ExtensionAPI): void {
 				};
 				return classify(classifierDeps, request, timeouts);
 			},
-			escalate: async (toolName, reason) => {
-				const allowOnce = "Allow once";
-				const allowSession = "Allow for this session";
-				const choice = await ctx.ui.select(`autoclassifier: ${reason}`, [
-					{ label: allowOnce, description: `Run this ${toolName} call now.` },
-					{ label: "Deny", description: "Block the call and tell the agent why." },
-					{ label: allowSession, description: "Stop asking about this exact call for the rest of the session." },
-				]);
-				if (choice === allowOnce) return "once";
-				if (choice === allowSession) return "session";
-				// Cancelled, timed out, or headless: never read as consent.
-				return "deny" satisfies EscalationChoice;
-			},
+			escalate: (toolName, reason) => askUser(ctx, toolName, reason),
+			escalateViaParent: (toolName, reason) =>
+				requestParentEscalation(ctx.sessionManager.getSessionId(), toolName, reason, PARENT_PROMPT_TIMEOUT_MS),
 			notify: (message, level) => ctx.ui.notify(message, level),
 			reportChildDenial: (toolName, reason) => {
 				const id = ctx.sessionManager.getSessionId();
@@ -309,6 +352,15 @@ export default function autoclassifier(pi: ExtensionAPI): void {
 						verdicts.clear();
 					},
 					runSetup: () => runWizard(ctx),
+					runCalibration: async () => {
+						const results = await runCalibration({
+							configuredRole: classifierRole,
+							resolveModel: spec => ctx.models.resolve(spec),
+							resolveAuth: async model => ctx.modelRegistry.getApiKeyAndHeaders(model as Model),
+							complete: await loadCompletion(),
+						});
+						return report(results);
+					},
 					print: text => ctx.ui.notify(text, "info"),
 					sessionOverride,
 				},

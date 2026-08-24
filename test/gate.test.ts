@@ -265,6 +265,57 @@ describe("decision order", () => {
 	});
 });
 
+/**
+ * A block that only reaches the model is invisible: the user watching the session sees the agent change
+ * course with no explanation. Every refusal therefore also surfaces to the user.
+ */
+describe("visibility", () => {
+	test("a rule block notifies the user", async () => {
+		const h = harness({ cfg: { rules: { hardDeny: [], deny: ["bash(git push*)"], ask: [], allow: [] } } });
+		await decide(h.deps, call({ input: { command: "git push --force" } }));
+		expect(h.notices.length).toBe(1);
+		expect(h.notices[0]).toContain("git push --force");
+	});
+
+	test("an anti-tamper block notifies the user", async () => {
+		const h = harness();
+		await decide(h.deps, call({ toolName: "write", input: { path: "/agent/autoclassifier.yml" } }));
+		expect(h.notices.length).toBe(1);
+		expect(h.notices[0]).toContain("anti-tamper");
+	});
+
+	test("a classifier block notifies the user with the model's reason", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "Adds an SSH key.", risk: "high", stage: 2 } });
+		await decide(h.deps, call());
+		expect(h.notices.length).toBe(1);
+		expect(h.notices[0]).toContain("Adds an SSH key.");
+	});
+
+	test("an allowed call does not notify, so the gate stays quiet in normal use", async () => {
+		const h = harness();
+		await decide(h.deps, call());
+		await decide(h.deps, call({ toolName: "read", input: { path: "a.ts" } }));
+		expect(h.notices).toEqual([]);
+	});
+
+	test("a block in a subagent does not notify twice, since the registry already reports it", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "nope", risk: "high", stage: 2 } });
+		await decide(h.deps, call({ hasUI: false }));
+		expect(h.notices).toEqual([]);
+		expect(h.childDenials.length).toBe(1);
+	});
+
+	test("an escalated allow does not notify, because the user already answered", async () => {
+		const h = harness({
+			cfg: { escalate: true },
+			verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 },
+			escalate: "once",
+		});
+		await decide(h.deps, call());
+		expect(h.notices).toEqual([]);
+	});
+});
+
 describe("verdict cache", () => {
 	test("a classified allow is remembered and skips the second call", async () => {
 		const h = harness();
@@ -308,11 +359,24 @@ describe("failing closed", () => {
 		expect(h.state.degradedReason).toBe("model unreachable");
 	});
 
-	test("a degraded gate notifies once, not on every call", async () => {
+	/**
+	 * Announced per blocked call rather than once per session. A degraded gate refuses everything, and a
+	 * single early warning leaves every later refusal unexplained on screen, which is indistinguishable
+	 * from the agent silently giving up. The breaker caps how many can accumulate.
+	 */
+	test("a degraded gate announces every call it blocks", async () => {
 		const h = harness({ verdict: { kind: "failure", reason: "model unreachable" } });
 		await decide(h.deps, call({ input: { command: "a" } }));
 		await decide(h.deps, call({ input: { command: "b" } }));
-		expect(h.notices.length).toBe(1);
+		expect(h.notices.length).toBe(2);
+		expect(h.notices[1]).toContain("model unreachable");
+	});
+
+	test("a degraded block in a subagent stays quiet locally and reports upward instead", async () => {
+		const h = harness({ verdict: { kind: "failure", reason: "model unreachable" } });
+		await decide(h.deps, call({ hasUI: false }));
+		expect(h.notices).toEqual([]);
+		expect(h.childDenials.length).toBe(1);
 	});
 
 	test("a classifier that throws blocks rather than escaping", async () => {
@@ -409,15 +473,72 @@ describe("escalation", () => {
  * is rarely read. The policy is deliberately stricter there.
  */
 describe("subagents", () => {
-	test("an ask outcome becomes a block, since there is nothing to escalate to", async () => {
+	/**
+	 * A subagent has no dialog of its own, so with no parent reachable a would-be prompt stays a block.
+	 * Silence never reads as consent.
+	 */
+	test("an ask outcome blocks when no parent can be reached", async () => {
 		const h = harness({ cfg: { escalate: true, rules: { hardDeny: [], deny: [], ask: ["bash"], allow: [] } }, escalate: "once" });
 		const decision = await decide(h.deps, call({ hasUI: false }));
 		expect(decision.action).toBe("block");
+		expect(h.escalateCalls).toBe(0);
 	});
 
-	test("a classifier denial cannot be escalated away in a subagent", async () => {
+	test("a classifier denial blocks in a subagent when no parent can be reached", async () => {
 		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 }, escalate: "once" });
 		expect((await decide(h.deps, call({ hasUI: false }))).action).toBe("block");
+	});
+
+	/**
+	 * The interesting case: the decision rolls up to the session that started the work, because that is
+	 * where the person is. The subagent's own transcript is rarely read.
+	 */
+	test("a subagent escalation is answered by the parent session", async () => {
+		const asked: string[] = [];
+		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 } });
+		h.deps.escalateViaParent = async (toolName, reason) => {
+			asked.push(`${toolName}|${reason}`);
+			return "once";
+		};
+		const decision = await decide(h.deps, call({ hasUI: false }));
+		expect(decision).toMatchObject({ action: "allow", via: "escalated" });
+		expect(asked[0]).toContain("bash");
+		expect(asked[0]).toContain("risky");
+	});
+
+	test("the parent refusing keeps the subagent's call blocked", async () => {
+		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 } });
+		h.deps.escalateViaParent = async () => "deny";
+		expect((await decide(h.deps, call({ hasUI: false }))).action).toBe("block");
+	});
+
+	test("the parent allowing for the session is remembered for the subagent too", async () => {
+		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 } });
+		h.deps.escalateViaParent = async () => "session";
+		await decide(h.deps, call({ hasUI: false }));
+		expect(h.cache.isAllowed("bash", { command: "git status" })).toBe(true);
+	});
+
+	test("an interactive session asks itself, never a peer", async () => {
+		let viaParent = 0;
+		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 }, escalate: "once" });
+		h.deps.escalateViaParent = async () => {
+			viaParent++;
+			return "deny";
+		};
+		await decide(h.deps, call({ hasUI: true }));
+		expect(h.escalateCalls).toBe(1);
+		expect(viaParent).toBe(0);
+	});
+
+	test("a parent cannot lift anti-tamper for a subagent", async () => {
+		const h = harness({ cfg: { escalate: true } });
+		h.deps.escalateViaParent = async () => "once";
+		const decision = await decide(
+			h.deps,
+			call({ hasUI: false, toolName: "write", input: { path: "/agent/autoclassifier.yml" } }),
+		);
+		expect(decision.action).toBe("block");
 	});
 
 	test("the fast-path allow list still applies in a subagent", async () => {

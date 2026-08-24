@@ -61,6 +61,11 @@ export interface GateDeps {
 	env: (name: string) => string | undefined;
 	classify: (request: EvidenceRequest, timeouts: Timeouts) => Promise<ClassifyResult>;
 	escalate: (toolName: string, reason: string) => Promise<EscalationChoice>;
+	/**
+	 * Ask an interactive session on behalf of a headless one. Absent means a subagent cannot escalate and
+	 * a would-be prompt becomes a block.
+	 */
+	escalateViaParent?: (toolName: string, reason: string) => Promise<EscalationChoice>;
 	notify: (message: string, level: "info" | "warning" | "error") => void;
 	reportChildDenial: (toolName: string, reason: string) => void;
 	log: (record: DecisionRecord) => void;
@@ -207,15 +212,15 @@ export async function decide(deps: GateDeps, request: GateRequest): Promise<Gate
 	if (verdict.kind === "failure") {
 		// `recordFailure` already counts this as a denial, so the emit below must not count it again.
 		deps.state.recordFailure(verdict.reason);
-		if (deps.state.shouldNotice("failure")) {
-			deps.notify(`autoclassifier is degraded and blocking tool calls: ${verdict.reason}`, "error");
-		}
 		if (!hasUI) deps.reportChildDenial(toolName, verdict.reason);
 		const decision: GateDecision = {
 			action: "block",
 			via: "failure",
-			reason: `autoclassifier: the risk classifier could not reach a verdict, so this call was blocked (${verdict.reason}). Tell the user; do not retry.`,
+			reason: `autoclassifier blocked \`${toolName}\`: the risk classifier could not reach a verdict (${verdict.reason}). The gate fails closed, so the call did not run. Tell the user and do not retry.`,
 		};
+		// Announced on every blocked call, not once per session. A degraded gate refuses everything, and
+		// a single early warning would leave every later refusal unexplained on screen.
+		if (hasUI) deps.notify(decision.reason, "error");
 		emit(deps, request, decision, { reason: verdict.reason });
 		return decision;
 	}
@@ -247,16 +252,22 @@ async function resolveAsk(
 	extra: Partial<DecisionRecord>,
 ): Promise<GateDecision> {
 	const cfg = deps.config();
-	if (cfg.escalate && request.hasUI) {
-		let choice: EscalationChoice;
-		try {
-			choice = await deps.escalate(request.toolName, reason);
-		} catch {
-			choice = "deny";
-		}
-		if (choice !== "deny") {
-			if (choice === "session") deps.cache.allow(request.toolName, request.input);
-			return finish(deps, request, { action: "allow", via: "escalated" }, extra);
+	if (cfg.escalate) {
+		// A headless session has no dialog of its own, so it borrows an interactive one through the
+		// module-level registry. That beats a flat refusal: the person who started the work is the one who
+		// should answer, and they cannot see the subagent's transcript.
+		const ask = request.hasUI ? deps.escalate : deps.escalateViaParent;
+		if (ask !== undefined) {
+			let choice: EscalationChoice;
+			try {
+				choice = await ask(request.toolName, reason);
+			} catch {
+				choice = "deny";
+			}
+			if (choice !== "deny") {
+				if (choice === "session") deps.cache.allow(request.toolName, request.input);
+				return finish(deps, request, { action: "allow", via: "escalated" }, extra);
+			}
 		}
 	}
 	const blockVia: Via = via === "ask" ? "ask" : "classifier";
@@ -302,7 +313,15 @@ function emit(deps: GateDeps, request: GateRequest, decision: GateDecision, extr
  */
 const MODEL_DECIDED: Partial<Record<Via, true>> = { classifier: true, escalated: true, failure: true };
 
-/** Count it, log it, return it. Every gated decision goes through here so none can skip bookkeeping. */
+/**
+ * Count it, announce it, log it, return it. Every gated decision goes through here so none can skip
+ * bookkeeping.
+ *
+ * A block also notifies the user. Returning the reason to the model alone makes a refusal invisible on
+ * screen: the agent simply changes course and the person watching has no idea the gate intervened. In a
+ * headless session the notification is skipped, because the cross-session registry already reports it
+ * to whoever can actually see a message.
+ */
 function finish(
 	deps: GateDeps,
 	request: GateRequest,
@@ -312,6 +331,7 @@ function finish(
 	const attribution = { classified: MODEL_DECIDED[decision.via] === true };
 	if (decision.action === "allow") deps.state.recordAllow(attribution);
 	else deps.state.recordDeny(attribution);
+	if (decision.action === "block" && request.hasUI) deps.notify(decision.reason, "warning");
 	emit(deps, request, decision, extra);
 	return decision;
 }

@@ -27,6 +27,8 @@ export interface CommandDeps {
 	logDisabledReason: string | undefined;
 	reload: () => void;
 	runSetup: () => Promise<void>;
+	/** Runs the calibration matrix against the live classifier and returns a report. */
+	runCalibration: () => Promise<string>;
 	print: (text: string) => void;
 	sessionOverride: SessionOverride;
 }
@@ -43,6 +45,7 @@ const SUBCOMMANDS = [
 	"rules",
 	"denials",
 	"log",
+	"calibrate",
 ] as const;
 
 const HISTORY_LIMIT = 20;
@@ -198,6 +201,10 @@ export async function runCommand(deps: CommandDeps, args: string): Promise<void>
 			return;
 		case "log":
 			deps.print(historyView(deps, false));
+			return;
+		case "calibrate":
+			deps.print("autoclassifier: running the calibration matrix against the live classifier. This takes a minute.");
+			deps.print(await deps.runCalibration());
 			return;
 		default:
 			deps.print(`autoclassifier: unknown subcommand \`${name}\`. Try one of: ${SUBCOMMANDS.join(", ")}.`);
