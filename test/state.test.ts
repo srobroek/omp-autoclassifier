@@ -33,6 +33,58 @@ describe("counters", () => {
 });
 
 /**
+ * The point of the tool is that a model judges the risky calls. Without a visible count of how many
+ * decisions actually reached the model, a heavy allowlist could quietly turn it into a pattern matcher
+ * and nothing would report the difference.
+ */
+describe("classifier coverage", () => {
+	test("a fast-path decision counts as checked but not as classified", () => {
+		const state = new GateState(thresholds);
+		state.recordAllow();
+		expect(state.snapshot()).toMatchObject({ checked: 1, classified: 0 });
+	});
+
+	test("a decision the model made counts as classified", () => {
+		const state = new GateState(thresholds);
+		state.recordAllow({ classified: true });
+		expect(state.snapshot()).toMatchObject({ checked: 1, classified: 1 });
+	});
+
+	test("a denial by the model counts as classified", () => {
+		const state = new GateState(thresholds);
+		state.recordDeny({ classified: true });
+		expect(state.snapshot()).toMatchObject({ denied: 1, classified: 1 });
+	});
+
+	test("a denial by a static rule does not count as classified", () => {
+		const state = new GateState(thresholds);
+		state.recordDeny();
+		expect(state.snapshot()).toMatchObject({ denied: 1, classified: 0 });
+	});
+
+	test("a classifier failure counts as classified, since the model was consulted", () => {
+		const state = new GateState(thresholds);
+		state.recordFailure("unreachable");
+		expect(state.snapshot()).toMatchObject({ classified: 1 });
+	});
+
+	test("the classified count survives a restore", () => {
+		const state = new GateState(thresholds);
+		state.recordAllow({ classified: true });
+		const restored = new GateState(thresholds);
+		restored.restore(state.snapshot());
+		expect(restored.snapshot()).toMatchObject({ classified: 1 });
+	});
+
+	test("resume keeps the coverage counters, which describe the session not the breaker", () => {
+		const state = new GateState(thresholds);
+		state.recordAllow({ classified: true });
+		state.resume();
+		expect(state.snapshot()).toMatchObject({ checked: 1, classified: 1 });
+	});
+});
+
+/**
  * The breaker exists so a misfiring gate cannot wall off a session indefinitely. Both vendors surveyed
  * pause on a run of refusals rather than trusting the reviewer to recover on its own.
  */

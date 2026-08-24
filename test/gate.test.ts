@@ -1,11 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { ConfigStore } from "../src/config";
 import { VerdictCache } from "../src/cache";
 import type { ClassifyResult } from "../src/classifier";
-import { compileRules, expandDefaults, pathVars } from "../src/rules";
-import { DEFAULT_ALLOW, DEFAULT_ENVIRONMENT, DEFAULT_HARD_DENY, EVIDENCE_DEFAULTS, SCALAR_DEFAULTS } from "../src/defaults";
 import type { EffectiveConfig } from "../src/config";
-import { decide, type GateDeps, type GateRequest } from "../src/gate";
+import { DEFAULT_ALLOW, DEFAULT_ENVIRONMENT, DEFAULT_HARD_DENY, EVIDENCE_DEFAULTS, SCALAR_DEFAULTS } from "../src/defaults";
+import { decide, type DecisionRecord, type GateDeps, type GateRequest } from "../src/gate";
+import { compileRules, pathVars } from "../src/rules";
 import { GateState } from "../src/state";
 
 const vars = pathVars("/agent", "/work", "/plugins");
@@ -40,6 +39,7 @@ interface Harness {
 	notices: string[];
 	childDenials: string[];
 	logged: { decision: string; via: string }[];
+	records: DecisionRecord[];
 }
 
 function harness(options: {
@@ -59,6 +59,7 @@ function harness(options: {
 		notices: [],
 		childDenials: [],
 		logged: [],
+		records: [],
 		deps: {} as GateDeps,
 	};
 	result.deps = {
@@ -85,6 +86,7 @@ function harness(options: {
 		},
 		log: record => {
 			result.logged.push({ decision: record.decision, via: record.via });
+			result.records.push(record);
 		},
 	};
 	return result;
@@ -193,10 +195,73 @@ describe("decision order", () => {
 		expect(h.classifyCalls).toBe(1);
 	});
 
-	test("the block reason names the rule that fired, so the model can react", async () => {
-		const h = harness({ cfg: { rules: { hardDeny: [], deny: ["bash(git push*)"], ask: [], allow: [] } } });
+	/**
+	 * A refusal has to be self-explanatory. The reason is the only thing the model and the user see, so
+	 * it must name what was blocked, which concrete target tripped it, which rule fired, where that rule
+	 * came from, and what to do next. Naming the pattern alone leaves `<agentDir>` placeholders on screen
+	 * and no way to tell a shipped rule from one the user wrote.
+	 */
+	test("a deny reason names the target, the rule, its origin, and the next step", async () => {
+		const h = harness({
+			cfg: {
+				rules: { hardDeny: [], deny: ["bash(git push*)"], ask: [], allow: [] },
+				origins: { "rules.deny": "user autoclassifier.yml" },
+			},
+		});
 		const decision = await decide(h.deps, call({ input: { command: "git push --force" } }));
-		expect(decision).toMatchObject({ action: "block", reason: expect.stringContaining("bash(git push*)") });
+		expect(decision.action).toBe("block");
+		if (decision.action !== "block") return;
+		expect(decision.reason).toContain("bash");
+		expect(decision.reason).toContain("git push --force");
+		expect(decision.reason).toContain("bash(git push*)");
+		expect(decision.reason).toContain("user autoclassifier.yml");
+	});
+
+	test("an anti-tamper reason names the resolved path, not the placeholder pattern", async () => {
+		const h = harness();
+		const decision = await decide(
+			h.deps,
+			call({ toolName: "write", input: { path: "/agent/autoclassifier.yml" } }),
+		);
+		expect(decision.action).toBe("block");
+		if (decision.action !== "block") return;
+		expect(decision.reason).toContain("/agent/autoclassifier.yml");
+		expect(decision.reason).toContain("write(<agentDir>/autoclassifier.yml)");
+		expect(decision.reason.toLowerCase()).toContain("ask the user");
+	});
+
+	test("an anti-tamper reason says the rule is shipped when the user did not write it", async () => {
+		const h = harness();
+		const decision = await decide(h.deps, call({ toolName: "write", input: { path: "/agent/autoclassifier.yml" } }));
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(decision.reason).toContain("shipped default");
+	});
+
+	test("an anti-tamper reason explains why the target is protected", async () => {
+		const h = harness();
+		const decision = await decide(h.deps, call({ toolName: "write", input: { path: "/agent/autoclassifier.yml" } }));
+		if (decision.action !== "block") throw new Error("expected a block");
+		const reason = decision.reason.toLowerCase();
+		// States the cause, not just the refusal: these settings govern the gate, so the gated agent
+		// cannot edit them.
+		expect(reason).toContain("govern");
+		expect(reason).toContain("cannot edit");
+	});
+
+	test("a reason stays usable when the call carried no reportable argument", async () => {
+		const h = harness({ cfg: { rules: { hardDeny: [], deny: ["computer"], ask: [], allow: [] } } });
+		const decision = await decide(h.deps, call({ toolName: "computer", input: {} }));
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(decision.reason).toContain("computer");
+		expect(decision.reason).not.toContain("undefined");
+	});
+
+	test("the audit log records the target alongside the rule", async () => {
+		const h = harness({ cfg: { rules: { hardDeny: [], deny: ["bash(git push*)"], ask: [], allow: [] } } });
+		await decide(h.deps, call({ input: { command: "git push --force" } }));
+		expect(h.logged[0]).toMatchObject({ decision: "block", via: "deny" });
+		expect(h.records[0]?.target).toBe("git push --force");
+		expect(h.records[0]?.rule).toBe("bash(git push*)");
 	});
 });
 
@@ -457,6 +522,69 @@ describe("bookkeeping", () => {
 		const h = harness({ verdict: { kind: "failure", reason: "down" } });
 		await decide(h.deps, call());
 		expect(h.state.snapshot()).toMatchObject({ checked: 1, denied: 1 });
+	});
+
+	/**
+	 * Attribution has to be decided where the decision is, not at the counter. If the gate credited every
+	 * decision to the model, a pure pattern matcher would report full classifier coverage.
+	 */
+	test("a rule decision is not credited to the model", async () => {
+		const h = harness();
+		await decide(h.deps, call({ toolName: "read", input: { path: "a.ts" } }));
+		expect(h.state.snapshot()).toMatchObject({ checked: 1, classified: 0 });
+	});
+
+	test("a classifier decision is credited to the model", async () => {
+		const h = harness();
+		await decide(h.deps, call());
+		expect(h.state.snapshot()).toMatchObject({ checked: 1, classified: 1 });
+	});
+
+	test("a rule block is not credited to the model", async () => {
+		const h = harness({ cfg: { rules: { hardDeny: [], deny: ["bash"], ask: [], allow: [] } } });
+		await decide(h.deps, call());
+		expect(h.state.snapshot()).toMatchObject({ denied: 1, classified: 0 });
+	});
+
+	test("an anti-tamper block is not credited to the model", async () => {
+		const h = harness();
+		await decide(h.deps, call({ toolName: "write", input: { path: "/agent/autoclassifier.yml" } }));
+		expect(h.state.snapshot()).toMatchObject({ denied: 1, classified: 0 });
+	});
+
+	test("a cached allow is not credited to the model a second time", async () => {
+		const h = harness();
+		await decide(h.deps, call());
+		await decide(h.deps, call());
+		expect(h.state.snapshot()).toMatchObject({ checked: 2, classified: 1 });
+	});
+
+	/** The model produced the verdict the user then overrode, so the model did the work. */
+	test("an escalated allow is credited to the model", async () => {
+		const h = harness({
+			cfg: { escalate: true },
+			verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 },
+			escalate: "once",
+		});
+		await decide(h.deps, call());
+		expect(h.state.snapshot()).toMatchObject({ classified: 1 });
+	});
+
+	test("an anti-tamper block records the target it fired on", async () => {
+		const h = harness();
+		await decide(h.deps, call({ toolName: "write", input: { path: "/agent/autoclassifier.yml" } }));
+		expect(h.records[0]).toMatchObject({
+			via: "hardDeny",
+			rule: "write(<agentDir>/autoclassifier.yml)",
+			target: "/agent/autoclassifier.yml",
+		});
+	});
+
+	test("an anti-tamper block is labelled as anti-tamper, not as an ordinary deny", async () => {
+		const h = harness();
+		const decision = await decide(h.deps, call({ toolName: "write", input: { path: "/agent/autoclassifier.yml" } }));
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(decision.reason).toContain("anti-tamper rule");
 	});
 
 	test("a repeated denial eventually pauses the gate through the breaker", async () => {

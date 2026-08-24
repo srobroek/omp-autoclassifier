@@ -9,7 +9,7 @@ import {
 	type PathVars,
 	type RuleLists,
 } from "../src/defaults";
-import { compileRules, expandDefaults, matchRule, primaryArgument } from "../src/rules";
+import { compileRules, evaluateRules, expandDefaults, matchRule, primaryArgument } from "../src/rules";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ac-rules-"));
 const realTmpRoot = fs.realpathSync(tmpRoot);
@@ -287,6 +287,52 @@ describe("url-scheme targets", () => {
 	test("scheme comparison ignores case", () => {
 		expect(match({ allow: ["read"] }, "read", { path: "SSH://host/x" })).toBeUndefined();
 		expect(match({ allow: ["read"] }, "read", { path: "SKILL://x" })).toBe("allow");
+	});
+});
+
+/**
+ * A block message that names only the rule pattern leaves the reader guessing which file or command
+ * tripped it, and `<agentDir>` placeholders make a shipped rule unreadable. The match therefore reports
+ * the concrete target it fired on.
+ */
+describe("matched target reporting", () => {
+	test("a path rule reports the resolved path it fired on", () => {
+		const compiled = compileRules(lists({ hardDeny: ["write(<agentDir>/config.yml)"] }), vars);
+		const match = evaluateRules(compiled, "write", { path: path.join(vars.agentDir, "config.yml") }, vars.cwd);
+		expect(match?.list).toBe("hardDeny");
+		expect(match?.target).toBe(path.join(vars.agentDir, "config.yml"));
+	});
+
+	test("a multi-path call reports the specific path that matched, not the whole list", () => {
+		const compiled = compileRules(lists({ hardDeny: ["edit(<agentDir>/config.yml)"] }), vars);
+		const protectedFile = path.join(vars.agentDir, "config.yml");
+		const match = evaluateRules(compiled, "edit", { paths: [path.join(vars.cwd, "a.ts"), protectedFile] }, vars.cwd);
+		expect(match?.target).toBe(protectedFile);
+	});
+
+	test("a command rule reports the command it fired on", () => {
+		const compiled = compileRules(lists({ deny: ["bash(*git push*)"] }), vars);
+		const match = evaluateRules(compiled, "bash", { command: "git push --force origin main" }, vars.cwd);
+		expect(match?.target).toBe("git push --force origin main");
+	});
+
+	test("an oversized target is truncated so a block message stays readable", () => {
+		const compiled = compileRules(lists({ deny: ["bash"] }), vars);
+		const match = evaluateRules(compiled, "bash", { command: "x".repeat(1000) }, vars.cwd);
+		expect(match?.target?.length).toBeLessThan(400);
+	});
+
+	test("a bare tool rule still reports the argument, so the message is specific", () => {
+		const compiled = compileRules(lists({ deny: ["eval"] }), vars);
+		const match = evaluateRules(compiled, "eval", { code: "print(1)" }, vars.cwd);
+		expect(match?.target).toBe("print(1)");
+	});
+
+	test("a call with no usable argument reports no target rather than an empty string", () => {
+		const compiled = compileRules(lists({ deny: ["computer"] }), vars);
+		const match = evaluateRules(compiled, "computer", {}, vars.cwd);
+		expect(match?.list).toBe("deny");
+		expect(match?.target).toBeUndefined();
 	});
 });
 

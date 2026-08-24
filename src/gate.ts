@@ -24,7 +24,7 @@ import type { ClassifyResult, Timeouts } from "./classifier";
 import type { EffectiveConfig } from "./config";
 import { DISABLE_ENV_VAR } from "./defaults";
 import type { EvidenceRequest, TranscriptEntry } from "./evidence";
-import { evaluateRules } from "./rules";
+import { evaluateRules, type RuleMatch } from "./rules";
 import type { GateState } from "./state";
 
 export interface GateRequest {
@@ -45,6 +45,8 @@ export interface DecisionRecord {
 	via: Via;
 	reason?: string;
 	rule?: string;
+	/** The concrete path or argument the rule matched, so a reader can see what tripped it. */
+	target?: string;
 	risk?: string;
 	stage?: number;
 	hasUI: boolean;
@@ -87,6 +89,26 @@ function describe(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * A refusal the reader can act on without asking anyone.
+ *
+ * The reason string is the entire interface of a block: the model reads it as a tool error and the user
+ * reads it on screen. Naming only the rule pattern leaves `<agentDir>` placeholders on the screen and no
+ * way to tell a shipped rule from one the user wrote, so this states the tool, the concrete target, the
+ * rule, and where the rule came from.
+ */
+function explain(cfg: EffectiveConfig, match: RuleMatch, toolName: string, guidance: string[]): string {
+	const label = match.list === "hardDeny" ? "anti-tamper rule" : `${match.list} rule`;
+	const origin = cfg.origins[`rules.${match.list}`] ?? "default";
+	const source = origin === "default" ? "shipped default" : origin;
+	const subject = match.target === undefined ? `\`${toolName}\`` : `\`${toolName}\` on ${match.target}`;
+	return [
+		`autoclassifier blocked ${subject}.`,
+		`It matched the ${label} \`${match.source}\` (${source}).`,
+		...guidance,
+	].join(" ");
+}
+
 export async function decide(deps: GateDeps, request: GateRequest): Promise<GateDecision> {
 	const cfg = deps.config();
 	const { toolName, input, hasUI } = request;
@@ -101,11 +123,19 @@ export async function decide(deps: GateDeps, request: GateRequest): Promise<Gate
 	// Anti-tamper outranks the mode filter and the breaker on purpose. If either lifted it, the agent
 	// could disable the gate in exactly the window where nothing is watching.
 	if (match?.list === "hardDeny") {
-		return finish(deps, request, {
-			action: "block",
-			via: "hardDeny",
-			reason: `autoclassifier: blocked by the anti-tamper rule \`${match.source}\`. This protects the gate's own configuration; ask the user to change it rather than editing it yourself.`,
-		}, { rule: match.source });
+		return finish(
+			deps,
+			request,
+			{
+				action: "block",
+				via: "hardDeny",
+				reason: explain(cfg, match, toolName, [
+					"Anti-tamper rules cover the settings that govern this gate, so the agent it gates cannot edit them.",
+					"Ask the user to make this change. Do not attempt another route to it.",
+				]),
+			},
+			{ rule: match.source, target: match.target },
+		);
 	}
 
 	const activeModes = cfg.activeModes.split(",").map(mode => mode.trim());
@@ -113,11 +143,18 @@ export async function decide(deps: GateDeps, request: GateRequest): Promise<Gate
 	if (deps.state.paused) return { action: "allow", via: "paused" };
 
 	if (match?.list === "deny") {
-		return finish(deps, request, {
-			action: "block",
-			via: "deny",
-			reason: `autoclassifier: blocked by the deny rule \`${match.source}\`.`,
-		}, { rule: match.source });
+		return finish(
+			deps,
+			request,
+			{
+				action: "block",
+				via: "deny",
+				reason: explain(cfg, match, toolName, [
+					"Tell the user which rule refused this. Do not attempt another route to the same effect.",
+				]),
+			},
+			{ rule: match.source, target: match.target },
+		);
 	}
 	if (match?.list === "allow") {
 		return finish(deps, request, { action: "allow", via: "allow" }, { rule: match.source });
@@ -259,6 +296,12 @@ function emit(deps: GateDeps, request: GateRequest, decision: GateDecision, extr
 	);
 }
 
+/**
+ * Decision paths where a model produced the verdict. Everything else was decided by a static rule, the
+ * cache, or a switch, and is counted separately so `/autoclassifier status` can show the split.
+ */
+const MODEL_DECIDED: Partial<Record<Via, true>> = { classifier: true, escalated: true, failure: true };
+
 /** Count it, log it, return it. Every gated decision goes through here so none can skip bookkeeping. */
 function finish(
 	deps: GateDeps,
@@ -266,8 +309,9 @@ function finish(
 	decision: GateDecision,
 	extra: Partial<DecisionRecord>,
 ): GateDecision {
-	if (decision.action === "allow") deps.state.recordAllow();
-	else deps.state.recordDeny();
+	const attribution = { classified: MODEL_DECIDED[decision.via] === true };
+	if (decision.action === "allow") deps.state.recordAllow(attribution);
+	else deps.state.recordDeny(attribution);
 	emit(deps, request, decision, extra);
 	return decision;
 }

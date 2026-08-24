@@ -84,6 +84,12 @@ function status(deps: CommandDeps): string {
 		`Checked ${snapshot.checked} · allowed ${snapshot.allowed} · blocked ${snapshot.denied}` +
 			` · consecutive blocks ${snapshot.consecutiveDenials}/${cfg.maxConsecutiveDenials}`,
 	);
+	// The split between model verdicts and rule or cache decisions. Reported because a growing allowlist
+	// silently converts this from a classifier into a pattern matcher, and nothing else would show it.
+	lines.push(
+		`Model classified ${snapshot.classified} of ${snapshot.checked} gated call(s);` +
+			` the rest matched a rule or a cached verdict.`,
+	);
 	lines.push(`Active in modes: ${cfg.activeModes} · escalation ${cfg.escalate ? "on" : "off"}`);
 	if (deps.logDisabledReason !== undefined) lines.push(`Audit log disabled: ${deps.logDisabledReason}`);
 	lines.push(

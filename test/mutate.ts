@@ -100,26 +100,26 @@ const rulesMutations: Mutation[] = [
 	},
 	{
 		name: "bare tool rules ignore the tool name",
-		from: "\tif (!matcher.tool.test(toolName)) return false;",
+		from: "\tif (!matcher.tool.test(toolName)) return undefined;",
 		to: "",
 		expect: "bare tool name matches every call",
 	},
 	{
 		name: "empty path argument matches a path rule",
-		from: "\t\tif (resolved.length === 0) return false;",
+		from: "\t\tif (resolved.length === 0) return undefined;",
 		to: "",
 		expect: "names no path",
 	},
 	{
 		name: "allow accepts a partial multi-path match",
-		from: 'return list === "allow" ? resolved.every(target => arg.test(target)) : resolved.some(target => arg.test(target));',
-		to: "return resolved.some(target => arg.test(target));",
+		from: '\t\t\treturn resolved.every(target => arg.test(target)) ? { target: describeTarget(resolved[0]) } : undefined;',
+		to: "\t\t\treturn resolved.some(target => arg.test(target)) ? { target: describeTarget(resolved[0]) } : undefined;",
 		expect: "every targeted path",
 	},
 	{
 		name: "deny requires every path instead of any",
-		from: 'return list === "allow" ? resolved.every(target => arg.test(target)) : resolved.some(target => arg.test(target));',
-		to: "return resolved.every(target => arg.test(target));",
+		from: "\t\tconst hit = resolved.find(target => arg.test(target));",
+		to: "\t\tconst hit = resolved.every(target => arg.test(target)) ? resolved[0] : undefined;",
 		expect: "any targeted path",
 	},
 	{
@@ -154,7 +154,7 @@ const rulesMutations: Mutation[] = [
 	},
 	{
 		name: "remote targets no longer disqualify a blanket allow",
-		from: '\tif (list === "allow" && !matcher.schemeAware && remoteTargets().length > 0) return false;',
+		from: '\tif (list === "allow" && !matcher.schemeAware && remoteTargets().length > 0) return undefined;',
 		to: "",
 		expect: "blanket allow does not fast-path a remote target",
 	},
@@ -166,8 +166,8 @@ const rulesMutations: Mutation[] = [
 	},
 	{
 		name: "the remote check also blocks denies",
-		from: '\tif (list === "allow" && !matcher.schemeAware && remoteTargets().length > 0) return false;',
-		to: "\tif (!matcher.schemeAware && remoteTargets().length > 0) return false;",
+		from: '\tif (list === "allow" && !matcher.schemeAware && remoteTargets().length > 0) return undefined;',
+		to: "\tif (!matcher.schemeAware && remoteTargets().length > 0) return undefined;",
 		expect: "never weakens a deny",
 	},
 	{
@@ -593,7 +593,7 @@ const stateMutations: Mutation[] = [
 	},
 	{
 		name: "classifier failures bypass the breaker",
-		from: "\t\tthis.#degradedReason = reason;\n\t\tthis.recordDeny();",
+		from: "\t\tthis.recordDeny({ classified: true });",
 		to: "\t\tthis.#degradedReason = reason;",
 		expect: "failures count toward the breaker",
 	},
@@ -605,8 +605,8 @@ const stateMutations: Mutation[] = [
 	},
 	{
 		name: "an allow silently re-arms a paused gate",
-		from: "\trecordAllow(): void {\n\t\tthis.#checked++;",
-		to: "\trecordAllow(): void {\n\t\tthis.#paused = false;\n\t\tthis.#checked++;",
+		from: "\trecordAllow(options?: Attribution): void {\n\t\tthis.#checked++;",
+		to: "\trecordAllow(options?: Attribution): void {\n\t\tthis.#paused = false;\n\t\tthis.#checked++;",
 		expect: "does not silently re-arm",
 	},
 	{
@@ -843,13 +843,13 @@ const gateMutations: Mutation[] = [
 		// Keeps the `else` branch syntactically attached; an empty replacement is a parse error, which
 		// would fail the suite without proving anything.
 		name: "allows are not counted",
-		from: '\tif (decision.action === "allow") deps.state.recordAllow();',
-		to: '\tif (decision.action === "allow" && false) deps.state.recordAllow();',
+		from: '\tif (decision.action === "allow") deps.state.recordAllow(attribution);',
+		to: '\tif (decision.action === "allow" && false) deps.state.recordAllow(attribution);',
 		expect: "advance the counters",
 	},
 	{
 		name: "rule blocks are not counted",
-		from: "\telse deps.state.recordDeny();",
+		from: "\telse deps.state.recordDeny(attribution);",
 		to: "",
 		expect: "rule-based block counts toward the breaker",
 	},
@@ -860,6 +860,60 @@ const gateMutations: Mutation[] = [
 		expect: "bypassed call is not counted",
 	},
 	{
+		name: "the block message omits the concrete target",
+		from: "\tconst subject = match.target === undefined ? `\\`${toolName}\\`` : `\\`${toolName}\\` on ${match.target}`;",
+		to: "\tconst subject = `\\`${toolName}\\``;",
+		expect: "names the resolved path",
+	},
+	{
+		name: "the block message omits the rule that fired",
+		from: "\t\t`It matched the ${label} \\`${match.source}\\` (${source}).`,",
+		to: '\t\t"It matched a rule.",',
+		expect: "names the target, the rule, its origin",
+	},
+	{
+		name: "the block message omits where the rule came from",
+		from: "\tconst source = origin === \"default\" ? \"shipped default\" : origin;",
+		to: '\tconst source = "a rule";',
+		expect: "says the rule is shipped",
+	},
+	{
+		name: "the block message drops the guidance",
+		from: "\t\t...guidance,",
+		to: "",
+		expect: "explains why the target is protected",
+	},
+	{
+		name: "a hard deny is labelled like an ordinary deny",
+		from: '\tconst label = match.list === "hardDeny" ? "anti-tamper rule" : `${match.list} rule`;',
+		to: "\tconst label = `${match.list} rule`;",
+		expect: "labelled as anti-tamper",
+	},
+	{
+		name: "the audit record omits the matched target",
+		from: "\t\t\t{ rule: match.source, target: match.target },\n\t\t);\n\t}\n\n\tconst activeModes",
+		to: "\t\t\t{ rule: match.source },\n\t\t);\n\t}\n\n\tconst activeModes",
+		expect: "records the target it fired on",
+	},
+	{
+		name: "every decision counts as classified",
+		from: "\tconst attribution = { classified: MODEL_DECIDED[decision.via] === true };",
+		to: "\tconst attribution = { classified: true };",
+		expect: "a rule decision is not credited to the model",
+	},
+	{
+		name: "no decision counts as classified",
+		from: "\tconst attribution = { classified: MODEL_DECIDED[decision.via] === true };",
+		to: "\tconst attribution = { classified: false };",
+		expect: "a classifier decision is credited to the model",
+	},
+	{
+		name: "an escalated allow is not credited to the model",
+		from: "const MODEL_DECIDED: Partial<Record<Via, true>> = { classifier: true, escalated: true, failure: true };",
+		to: "const MODEL_DECIDED: Partial<Record<Via, true>> = { classifier: true, failure: true };",
+		expect: "an escalated allow is credited to the model",
+	},
+	{
 		name: "the log ignores the logDecisions switch",
 		from: "\tif (!deps.config().logDecisions) return;",
 		to: "",
@@ -868,7 +922,7 @@ const gateMutations: Mutation[] = [
 	{
 		name: "failures are counted twice",
 		from: "\t\tdeps.state.recordFailure(verdict.reason);",
-		to: "\t\tdeps.state.recordFailure(verdict.reason);\n\t\tdeps.state.recordDeny();",
+		to: "\t\tdeps.state.recordFailure(verdict.reason);\n\t\tdeps.state.recordDeny({ classified: true });",
 		expect: "counted exactly once",
 	},
 	{

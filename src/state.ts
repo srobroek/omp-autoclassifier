@@ -20,9 +20,21 @@ export interface StateSnapshot {
 	checked: number;
 	allowed: number;
 	denied: number;
+	/**
+	 * Decisions a model actually made, as opposed to ones a static rule or the cache made.
+	 *
+	 * Reported so the split stays visible: this is a classifier, and a heavy allowlist would quietly
+	 * turn it into a pattern matcher with nothing to show the difference.
+	 */
+	classified: number;
 	consecutiveDenials: number;
 	paused: boolean;
 	degradedReason?: string;
+}
+
+/** Whether a model produced this decision. */
+export interface Attribution {
+	classified?: boolean;
 }
 
 function counter(value: unknown): number | undefined {
@@ -35,6 +47,7 @@ export class GateState {
 	#checked = 0;
 	#allowed = 0;
 	#denied = 0;
+	#classified = 0;
 	#consecutive = 0;
 	#paused = false;
 	#degradedReason: string | undefined;
@@ -53,16 +66,18 @@ export class GateState {
 		return this.#degradedReason;
 	}
 
-	recordAllow(): void {
+	recordAllow(options?: Attribution): void {
 		this.#checked++;
 		this.#allowed++;
+		if (options?.classified === true) this.#classified++;
 		this.#consecutive = 0;
 		this.#degradedReason = undefined;
 	}
 
-	recordDeny(): void {
+	recordDeny(options?: Attribution): void {
 		this.#checked++;
 		this.#denied++;
+		if (options?.classified === true) this.#classified++;
 		this.#consecutive++;
 		this.#tripIfPiledUp();
 	}
@@ -70,7 +85,8 @@ export class GateState {
 	/** A classifier failure blocks, so it counts as a denial and also marks the gate degraded. */
 	recordFailure(reason: string): void {
 		this.#degradedReason = reason;
-		this.recordDeny();
+		// The model was consulted, so this counts toward coverage even though it produced no verdict.
+		this.recordDeny({ classified: true });
 	}
 
 	pause(): void {
@@ -96,6 +112,7 @@ export class GateState {
 			checked: this.#checked,
 			allowed: this.#allowed,
 			denied: this.#denied,
+			classified: this.#classified,
 			consecutiveDenials: this.#consecutive,
 			paused: this.#paused,
 		};
@@ -110,6 +127,7 @@ export class GateState {
 		this.#checked = counter(record.checked) ?? this.#checked;
 		this.#allowed = counter(record.allowed) ?? this.#allowed;
 		this.#denied = counter(record.denied) ?? this.#denied;
+		this.#classified = counter(record.classified) ?? this.#classified;
 		this.#consecutive = counter(record.consecutiveDenials) ?? this.#consecutive;
 		if (typeof record.paused === "boolean") this.#paused = record.paused;
 		if (typeof record.degradedReason === "string") this.#degradedReason = record.degradedReason;

@@ -236,7 +236,7 @@ export function compileRules(lists: RuleLists, vars: PathVars): CompiledRules {
 }
 
 /**
- * Whether `matcher` claims this call.
+ * Whether `matcher` claims this call, and the concrete target it fired on.
  *
  * The allow/deny asymmetry is the load-bearing part. A deny fires when *any* targeted path matches,
  * because one protected file is enough to refuse the call. An allow requires *every* targeted path to
@@ -250,27 +250,47 @@ function matcherClaims(
 	rawArgument: string,
 	targets: () => string[],
 	remoteTargets: () => string[],
-): boolean {
-	if (!matcher.tool.test(toolName)) return false;
+): { target?: string } | undefined {
+	if (!matcher.tool.test(toolName)) return undefined;
 	// omp promotes any tool call with an `ssh://` target to `exec` tier because the work happens on
 	// another host. A fast-path allow that never mentioned a scheme must not cover that, or the gate
 	// hands out remote execution for free. A rule that spells out the scheme is taken at its word.
-	if (list === "allow" && !matcher.schemeAware && remoteTargets().length > 0) return false;
+	if (list === "allow" && !matcher.schemeAware && remoteTargets().length > 0) return undefined;
 	const arg = matcher.arg;
-	if (arg === undefined) return true;
+	// A bare tool rule ignores arguments, but still reports one so the block message stays specific.
+	if (arg === undefined) return { target: describeTarget(rawArgument) };
 	if (matcher.pathwise && PATH_TOOLS.has(toolName)) {
 		const resolved = targets();
-		if (resolved.length === 0) return false;
-		return list === "allow" ? resolved.every(target => arg.test(target)) : resolved.some(target => arg.test(target));
+		if (resolved.length === 0) return undefined;
+		if (list === "allow") {
+			return resolved.every(target => arg.test(target)) ? { target: describeTarget(resolved[0]) } : undefined;
+		}
+		// Report the specific path that tripped the rule, not the whole list.
+		const hit = resolved.find(target => arg.test(target));
+		return hit === undefined ? undefined : { target: describeTarget(hit) };
 	}
-	return arg.test(rawArgument);
+	return arg.test(rawArgument) ? { target: describeTarget(rawArgument) } : undefined;
 }
 
-/** Which list claimed the call, and the rule text that did it. */
+/** Keep a block message readable: a 200-line heredoc is not useful in a one-line reason. */
+const MAX_TARGET_CHARS = 300;
+
+function describeTarget(value: string | undefined): string | undefined {
+	if (value === undefined) return undefined;
+	const trimmed = value.trim();
+	// `{}` and `null` are what serializing an argument-free call produces. Putting either in a block
+	// message adds noise and tells the reader nothing.
+	if (trimmed.length === 0 || trimmed === "{}" || trimmed === "null") return undefined;
+	return trimmed.length <= MAX_TARGET_CHARS ? trimmed : `${trimmed.slice(0, MAX_TARGET_CHARS)}…`;
+}
+
+/** Which list claimed the call, the rule text that did it, and the target it fired on. */
 export interface RuleMatch {
 	list: RuleVerdict;
 	/** Verbatim rule as written in config, for the block reason and the audit log. */
 	source: string;
+	/** The concrete path or argument that matched, truncated for display. */
+	target?: string;
 }
 
 /**
@@ -293,9 +313,8 @@ export function evaluateRules(
 
 	for (const list of ORDER) {
 		for (const matcher of compiled[list]) {
-			if (matcherClaims(matcher, list, toolName, rawArgument, targets, remotes)) {
-				return { list, source: matcher.source };
-			}
+			const claim = matcherClaims(matcher, list, toolName, rawArgument, targets, remotes);
+			if (claim !== undefined) return { list, source: matcher.source, target: claim.target };
 		}
 	}
 	return undefined;

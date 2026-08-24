@@ -128,6 +128,35 @@ describe("status", () => {
 		expect(say(h)).toMatch(/2\b/);
 	});
 
+	/**
+	 * A user has to be able to tell whether a model is doing the deciding. Without this line, a heavy
+	 * allowlist could reduce the tool to a pattern matcher and the status line would look identical.
+	 */
+	test("status reports how many decisions a model actually made", async () => {
+		const h = harness({ role: "prov/cheap-1" });
+		h.state.recordAllow();
+		h.state.recordAllow({ classified: true });
+		h.state.recordDeny({ classified: true });
+		await runCommand(h.deps, "status");
+		const text = say(h);
+		expect(text).toContain("classified");
+		expect(text).toMatch(/2 of 3/);
+	});
+
+	test("status reports the fast-path share when nothing reached a model", async () => {
+		const h = harness({ role: "prov/cheap-1" });
+		h.state.recordAllow();
+		h.state.recordAllow();
+		await runCommand(h.deps, "status");
+		expect(say(h)).toMatch(/0 of 2/);
+	});
+
+	test("status does not divide by zero before anything happens", async () => {
+		const h = harness({ role: "prov/cheap-1" });
+		await runCommand(h.deps, "status");
+		expect(say(h)).not.toContain("NaN");
+	});
+
 	test("status reflects a session switch, and says it is not persistent", async () => {
 		const h = harness({ role: "prov/cheap-1" });
 		let override: boolean | undefined;
