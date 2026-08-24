@@ -6,6 +6,8 @@
 			"package-name": "omp-autoclassifier",
 			"changelog-path": "CHANGELOG.md",
 			"include-component-in-tag": false,
+			"prerelease": true,
+			"prerelease-type": "alpha",
 			"bump-minor-pre-major": true,
 			"bump-patch-for-minor-pre-major": false
 		}
