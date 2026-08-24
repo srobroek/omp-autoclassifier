@@ -1,0 +1,137 @@
+{
+	"name": "omp-autoclassifier",
+	"version": "0.0.0",
+	"description": "Model-backed pre-execution risk classifier for the omp coding agent.",
+	"license": "Apache-2.0",
+	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/srobroek/omp-autoclassifier.git"
+	},
+	"homepage": "https://github.com/srobroek/omp-autoclassifier#readme",
+	"bugs": {
+		"url": "https://github.com/srobroek/omp-autoclassifier/issues"
+	},
+	"keywords": [
+		"omp",
+		"oh-my-pi",
+		"omp-extension",
+		"omp-plugin",
+		"coding-agent",
+		"security",
+		"auto-mode"
+	],
+	"files": [
+		"src",
+		"skills",
+		"LICENSE",
+		"NOTICE",
+		"README.md"
+	],
+	"omp": {
+		"name": "omp-autoclassifier",
+		"description": "Classifies every tool call before it runs and blocks the dangerous ones.",
+		"extensions": [
+			"./src/index.ts"
+		],
+		"settings": {
+			"enabled": {
+				"type": "boolean",
+				"default": true,
+				"description": "Master switch for the classifier gate."
+			},
+			"activeModes": {
+				"type": "string",
+				"default": "yolo,write,always-ask",
+				"description": "Comma-separated approval modes the gate runs in."
+			},
+			"escalate": {
+				"type": "boolean",
+				"default": false,
+				"description": "On deny, ask interactively instead of blocking outright (interactive sessions only)."
+			},
+			"classifySubagents": {
+				"type": "boolean",
+				"default": true,
+				"description": "Classify tool calls made inside spawned subagents."
+			},
+			"stage1TimeoutMs": {
+				"type": "number",
+				"default": 4000,
+				"min": 500,
+				"max": 25000,
+				"description": "Timeout for the fast filter stage, in milliseconds."
+			},
+			"stage2TimeoutMs": {
+				"type": "number",
+				"default": 10000,
+				"min": 1000,
+				"max": 28000,
+				"description": "Timeout for the reasoning stage, in milliseconds."
+			},
+			"maxConsecutiveDenials": {
+				"type": "number",
+				"default": 3,
+				"min": 1,
+				"description": "Consecutive denials before the gate pauses itself."
+			},
+			"maxTotalDenials": {
+				"type": "number",
+				"default": 20,
+				"min": 1,
+				"description": "Total denials per session before the gate pauses itself."
+			},
+			"cacheSize": {
+				"type": "number",
+				"default": 500,
+				"min": 0,
+				"description": "Maximum cached allow verdicts per session."
+			},
+			"includeToolResults": {
+				"type": "boolean",
+				"default": false,
+				"description": "Include recent tool output as untrusted classifier evidence."
+			},
+			"logDecisions": {
+				"type": "boolean",
+				"default": true,
+				"description": "Append allow and deny decisions to the JSONL audit log."
+			},
+			"logClassifierIo": {
+				"type": "boolean",
+				"default": false,
+				"description": "Also log full classifier prompts and responses. May capture secrets."
+			}
+		}
+	},
+	"peerDependencies": {
+		"@oh-my-pi/pi-ai": ">=18.0.0",
+		"@oh-my-pi/pi-coding-agent": ">=18.0.0"
+	},
+	"peerDependenciesMeta": {
+		"@oh-my-pi/pi-ai": {
+			"optional": true
+		},
+		"@oh-my-pi/pi-coding-agent": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@changesets/changelog-github": "^1.0.0",
+		"@changesets/cli": "^3.0.1",
+		"@types/bun": "^1.4.0",
+		"omp-host": "npm:@oh-my-pi/pi-coding-agent@18.0.4",
+		"omp-host-ai": "npm:@oh-my-pi/pi-ai@18.0.4",
+		"typescript": "^7.0.2"
+	},
+	"scripts": {
+		"check": "tsc --noEmit",
+		"test": "bun test",
+		"test:mutate": "bun run test/mutate.ts",
+		"verify": "bun run check && bun test && bun run test:mutate",
+		"changeset:version": "changeset version && bun install --lockfile-only"
+	},
+	"engines": {
+		"bun": ">=1.2.0"
+	}
+}

@@ -1,0 +1,22 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"lib": ["ES2023"],
+		"module": "preserve",
+		"moduleResolution": "bundler",
+		"moduleDetection": "force",
+		"types": ["bun"],
+		"strict": true,
+		"noUncheckedIndexedAccess": true,
+		"noImplicitOverride": true,
+		"noFallthroughCasesInSwitch": true,
+		"verbatimModuleSyntax": true,
+		"skipLibCheck": true,
+		"noEmit": true,
+		"paths": {
+			"@oh-my-pi/pi-coding-agent": ["./node_modules/omp-host"],
+			"@oh-my-pi/pi-ai": ["./node_modules/omp-host-ai"]
+		}
+	},
+	"include": ["src", "test"]
+}

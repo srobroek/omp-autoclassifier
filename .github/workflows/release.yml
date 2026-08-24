@@ -1,0 +1,54 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  # Required for npm trusted publishing: npm exchanges this OIDC token for a
+  # short-lived credential, so no long-lived NPM_TOKEN exists anywhere.
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # npm itself performs the publish, so it needs a Node toolchain with a
+      # version new enough for OIDC (npm >= 11.5.1, shipped with Node >= 22.14).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - run: bun install --frozen-lockfile
+
+      - name: Verify before releasing
+        run: bun run verify
+
+      - name: Open a version PR, or publish when one lands
+        uses: changesets/action@v1
+        with:
+          version: bun run changeset:version
+          publish: npm publish --access public
+          commit: "chore: release"
+          title: "chore: release"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Deliberately no NODE_AUTH_TOKEN: trusted publishing uses the OIDC
+          # token above. Setting one here would silently take precedence and
+          # publish without provenance.
