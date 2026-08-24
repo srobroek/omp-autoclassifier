@@ -518,7 +518,7 @@ const classifierMutations: Mutation[] = [
 	},
 	{
 		name: "an unrecognized decision defaults to allow",
-		from: '\tif (decision !== "allow" && decision !== "deny") return undefined;',
+		from: '\tif (decision !== "allow" && decision !== "ask" && decision !== "deny") return undefined;',
 		to: '\tif (decision !== "allow" && decision !== "deny") return { decision: "allow", risk: "low", reason: "unrecognized" };',
 		expect: "unrecognized decision value fails closed",
 	},
@@ -566,7 +566,7 @@ const classifierMutations: Mutation[] = [
 	},
 	{
 		name: "the policy prose is dropped from the reasoning stage",
-		from: "\tconst stage2System = [...STAGE2_SYSTEM, ...evidence.systemPrompt];",
+		from: "\tconst stage2System = [...STAGE2_SYSTEM, ...evidence.systemPrompt, ...schema];",
 		to: "\tconst stage2System = [...evidence.systemPrompt];",
 		expect: "states the policy it applies",
 	},
@@ -599,8 +599,8 @@ const stateMutations: Mutation[] = [
 	},
 	{
 		name: "resume leaves the counters in place",
-		from: "\t\tthis.#denied = 0;\n\t\tthis.#consecutive = 0;\n\t\tthis.#degradedReason = undefined;\n\t}",
-		to: "\t}",
+		from: "\t\tthis.#denied = 0;\n\t\tthis.#consecutive = 0;\n\t\tthis.#degradedReason = undefined;",
+		to: "",
 		expect: "resume re-arms the gate and clears both counters",
 	},
 	{
@@ -642,6 +642,18 @@ const stateMutations: Mutation[] = [
 ];
 
 const registryMutations: Mutation[] = [
+	{
+		name: "an earlier session inherits from a later one",
+		from: "\t\tif (registration.rank >= own.rank) continue;",
+		to: "\t\tif (false) continue;",
+		expect: "an earlier session does not inherit from a later one",
+	},
+	{
+		name: "the shared ledger grows without limit",
+		from: "\tif (registration.refusals.length > MAX_PER_SESSION) registration.refusals.shift();",
+		to: "",
+		expect: "",
+	},
 	{
 		name: "the reporting child notifies itself",
 		from: "\t\tif (id === childSessionId || !hooks.hasUI) continue;",
@@ -768,9 +780,9 @@ const gateMutations: Mutation[] = [
 	},
 	{
 		name: "the degraded notice repeats on every call",
-		from: '\t\tif (deps.state.shouldNotice("failure")) {',
-		to: "\t\tif (true) {",
-		expect: "degraded gate notifies once",
+		from: '\t\tif (hasUI) deps.notify(decision.reason, "error");',
+		to: "",
+		expect: "announces every call it blocks",
 	},
 	{
 		name: "an unconfigured classifier blocks silently instead of explaining",
@@ -780,15 +792,15 @@ const gateMutations: Mutation[] = [
 	},
 	{
 		name: "the prompt runs even when escalation is off",
-		from: "\tif (cfg.escalate && request.hasUI) {",
-		to: "\tif (request.hasUI) {",
+		from: "\tif (cfg.escalate) {",
+		to: "\tif (true) {",
 		expect: "ask rule blocks when escalation is off",
 	},
 	{
 		name: "escalation ignores the absence of a ui",
-		from: "\tif (cfg.escalate && request.hasUI) {",
-		to: "\tif (cfg.escalate) {",
-		expect: "there is nothing to escalate to",
+		from: "\t\tconst ask = request.hasUI ? deps.escalate : deps.escalateViaParent;",
+		to: "\t\tconst ask = deps.escalate;",
+		expect: "answered by the parent session",
 	},
 	{
 		name: "a rejected escalation still allows",
@@ -849,9 +861,45 @@ const gateMutations: Mutation[] = [
 	},
 	{
 		name: "rule blocks are not counted",
-		from: "\telse deps.state.recordDeny(attribution);",
+		from: "\t\tdeps.state.recordDeny(attribution);",
 		to: "",
 		expect: "rule-based block counts toward the breaker",
+	},
+	{
+		name: "a refusal is forgotten immediately",
+		from: "\t\tdeps.state.recordRefusal(refusal.toolName, refusal.target, refusal.reason);",
+		to: "",
+		expect: "a refusal is remembered",
+	},
+	{
+		name: "a refusal is not shared across sessions",
+		from: "\t\tdeps.shareRefusal(refusal);",
+		to: "",
+		expect: "a refusal is shared so a subagent spawned later inherits it",
+	},
+	{
+		name: "the review is never shown what was already refused",
+		from: "\t\t\t\trefusals: [...deps.inheritedRefusals(), ...deps.state.refusals],",
+		to: "\t\t\t\trefusals: [],",
+		expect: "the next review is shown what was already refused",
+	},
+	{
+		name: "inherited refusals are dropped",
+		from: "\t\t\t\trefusals: [...deps.inheritedRefusals(), ...deps.state.refusals],",
+		to: "\t\t\t\trefusals: [...deps.state.refusals],",
+		expect: "a parent's refusal reaches this session's review",
+	},
+	{
+		name: "the audit record omits the target",
+		from: "\t\t...(target === undefined ? {} : { target }),",
+		to: "",
+		expect: "a classifier allow names what it allowed",
+	},
+	{
+		name: "a rule target is overwritten by the raw argument",
+		from: "\t\t...(target === undefined ? {} : { target }),\n\t\t...extra,",
+		to: "\t\t...extra,\n\t\t...(target === undefined ? {} : { target }),",
+		expect: "a rule match records the resolved path, not the raw argument",
 	},
 	{
 		name: "bypassed calls are counted",
@@ -893,7 +941,7 @@ const gateMutations: Mutation[] = [
 		name: "the audit record omits the matched target",
 		from: "\t\t\t{ rule: match.source, target: match.target },\n\t\t);\n\t}\n\n\tconst activeModes",
 		to: "\t\t\t{ rule: match.source },\n\t\t);\n\t}\n\n\tconst activeModes",
-		expect: "records the target it fired on",
+		expect: "a rule match records the resolved path, not the raw argument",
 	},
 	{
 		name: "every decision counts as classified",
@@ -927,8 +975,8 @@ const gateMutations: Mutation[] = [
 	},
 	{
 		name: "the configured timeouts are replaced with defaults",
-		from: "\t\t\t{ stage1TimeoutMs: cfg.stage1TimeoutMs, stage2TimeoutMs: cfg.stage2TimeoutMs },",
-		to: "\t\t\t{ stage1TimeoutMs: 4000, stage2TimeoutMs: 10000 },",
+		from: "\t\t\t\tstage1TimeoutMs: cfg.stage1TimeoutMs,",
+		to: "\t\t\t\tstage1TimeoutMs: 4000,",
 		expect: "configured timeouts are passed through",
 	},
 	{

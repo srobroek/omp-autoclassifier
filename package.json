@@ -102,6 +102,11 @@
 				"type": "boolean",
 				"default": false,
 				"description": "Also log full classifier prompts and responses. May capture secrets."
+			},
+			"suggestAlternative": {
+				"type": "boolean",
+				"default": false,
+				"description": "Ask the classifier to suggest a safer command when it refuses one. Costs extra tokens per review."
 			}
 		}
 	},

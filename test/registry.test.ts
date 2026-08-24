@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { registerSession, reportChildDenial, requestParentEscalation, unregisterSession } from "../src/registry";
+import {
+	inheritedRefusals,
+	recordSessionRefusal,
+	registerSession,
+	reportChildDenial,
+	requestParentEscalation,
+	unregisterSession,
+} from "../src/registry";
 
 const registered: string[] = [];
 
@@ -15,6 +22,92 @@ function register(id: string, sink: string[]): void {
 
 afterEach(() => {
 	for (const id of registered.splice(0)) unregisterSession(id);
+});
+
+/**
+ * The vector this closes, observed in a live run: a spawn was refused, the agent reworded it until a
+ * fresh review allowed it, and the subagent then ran the command the parent could not. The child's gate
+ * has its own state, so the parent's refusal never reached the review that mattered. Subagents run in
+ * this process, which is the only reason the two can be joined at all.
+ */
+describe("inherited refusals", () => {
+	test("a session with nothing registered before it inherits nothing", () => {
+		register("top", []);
+		expect(inheritedRefusals("top")).toEqual([]);
+	});
+
+	test("a later session inherits what an earlier one was refused", () => {
+		register("parent", []);
+		recordSessionRefusal("parent", { toolName: "bash", target: "git push --force", reason: "Destroys history." });
+		register("child", []);
+		expect(inheritedRefusals("child")).toEqual([
+			{ toolName: "bash", target: "git push --force", reason: "Destroys history." },
+		]);
+	});
+
+	test("a session never inherits its own refusals, which it already holds", () => {
+		register("only", []);
+		recordSessionRefusal("only", { toolName: "bash", target: "x", reason: "no" });
+		expect(inheritedRefusals("only")).toEqual([]);
+	});
+
+	test("an earlier sibling's refusals are inherited, since both descend from the same work", () => {
+		register("parent", []);
+		register("first-child", []);
+		recordSessionRefusal("first-child", { toolName: "bash", target: "y", reason: "no" });
+		register("second-child", []);
+		expect(inheritedRefusals("second-child").map(r => r.target)).toEqual(["y"]);
+	});
+
+	test("a refusal recorded after the child started still reaches it", () => {
+		register("parent", []);
+		register("child", []);
+		recordSessionRefusal("parent", { toolName: "bash", target: "late", reason: "no" });
+		expect(inheritedRefusals("child").map(r => r.target)).toEqual(["late"]);
+	});
+
+	test("a departed session's refusals do not haunt a later one", () => {
+		register("gone", []);
+		recordSessionRefusal("gone", { toolName: "bash", target: "old", reason: "no" });
+		unregisterSession("gone");
+		register("fresh", []);
+		expect(inheritedRefusals("fresh")).toEqual([]);
+	});
+
+	test("an unregistered session records nothing", () => {
+		recordSessionRefusal("ghost", { toolName: "bash", target: "x", reason: "no" });
+		register("later", []);
+		expect(inheritedRefusals("later")).toEqual([]);
+	});
+
+	test("duplicates across sessions are reported once", () => {
+		register("parent", []);
+		const refusal = { toolName: "bash", target: "same", reason: "no" };
+		recordSessionRefusal("parent", refusal);
+		register("child-a", []);
+		recordSessionRefusal("child-a", refusal);
+		register("child-b", []);
+		expect(inheritedRefusals("child-b").length).toBe(1);
+	});
+
+	/** Inheritance runs one way. A parent must not be argued at by work it spawned. */
+	test("an earlier session does not inherit from a later one", () => {
+		register("parent", []);
+		register("child", []);
+		recordSessionRefusal("child", { toolName: "bash", target: "childs", reason: "no" });
+		expect(inheritedRefusals("parent")).toEqual([]);
+	});
+
+	test("a long-running session's shared ledger is bounded", () => {
+		register("parent", []);
+		for (let index = 0; index < 40; index++) {
+			recordSessionRefusal("parent", { toolName: "bash", target: `c${index}`, reason: "no" });
+		}
+		register("child", []);
+		const inherited = inheritedRefusals("child");
+		expect(inherited.length).toBeLessThanOrEqual(16);
+		expect(inherited.at(-1)?.target).toBe("c39");
+	});
 });
 
 /**

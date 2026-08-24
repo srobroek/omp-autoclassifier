@@ -275,7 +275,7 @@ function matcherClaims(
 /** Keep a block message readable: a 200-line heredoc is not useful in a one-line reason. */
 const MAX_TARGET_CHARS = 300;
 
-function describeTarget(value: string | undefined): string | undefined {
+export function describeTarget(value: string | undefined): string | undefined {
 	if (value === undefined) return undefined;
 	const trimmed = value.trim();
 	// `{}` and `null` are what serializing an argument-free call produces. Putting either in a block

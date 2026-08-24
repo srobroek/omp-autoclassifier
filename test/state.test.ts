@@ -153,6 +153,69 @@ describe("circuit breaker", () => {
 	});
 });
 
+/**
+ * A refusal is not cached, deliberately, so that authorization given in chat takes effect at once. The
+ * cost is that an agent may simply ask again in different words. A live run did exactly that: a refused
+ * subagent spawn was reworded until a fresh review passed it. The ledger is what lets the next review
+ * see the pattern.
+ */
+describe("refusal ledger", () => {
+	test("a fresh gate has refused nothing", () => {
+		expect(new GateState(thresholds).refusals).toEqual([]);
+	});
+
+	test("a refusal is remembered with its tool, target, and reason", () => {
+		const state = new GateState(thresholds);
+		state.recordRefusal("task", "git push --force origin main", "Destroys shared history.");
+		expect(state.refusals).toEqual([
+			{ toolName: "task", target: "git push --force origin main", reason: "Destroys shared history." },
+		]);
+	});
+
+	test("refusals are kept oldest first", () => {
+		const state = new GateState(thresholds);
+		state.recordRefusal("bash", "one", "a");
+		state.recordRefusal("write", "two", "b");
+		expect(state.refusals.map(refusal => refusal.target)).toEqual(["one", "two"]);
+	});
+
+	test("the ledger is bounded so a long session cannot grow without limit", () => {
+		const state = new GateState(thresholds);
+		for (let index = 0; index < 40; index++) state.recordRefusal("bash", `c${index}`, "no");
+		expect(state.refusals.length).toBeLessThanOrEqual(16);
+		expect(state.refusals.at(-1)?.target).toBe("c39");
+	});
+
+	test("an identical refusal is not recorded twice", () => {
+		const state = new GateState(thresholds);
+		state.recordRefusal("bash", "same", "no");
+		state.recordRefusal("bash", "same", "no");
+		expect(state.refusals.length).toBe(1);
+	});
+
+	/** Resuming the gate is the user forgiving the session, so the history goes with the counters. */
+	test("resuming clears the ledger", () => {
+		const state = new GateState(thresholds);
+		state.recordRefusal("bash", "one", "a");
+		state.resume();
+		expect(state.refusals).toEqual([]);
+	});
+
+	test("the ledger survives a snapshot and restore", () => {
+		const state = new GateState(thresholds);
+		state.recordRefusal("task", "one", "a");
+		const restored = new GateState(thresholds);
+		restored.restore(state.snapshot());
+		expect(restored.refusals).toEqual([{ toolName: "task", target: "one", reason: "a" }]);
+	});
+
+	test("a malformed persisted ledger is ignored rather than trusted", () => {
+		const state = new GateState(thresholds);
+		state.restore({ refusals: [{ toolName: 7 }, "nope", null] });
+		expect(state.refusals).toEqual([]);
+	});
+});
+
 describe("degraded reporting", () => {
 	test("a failure records why the gate is degraded", () => {
 		const state = new GateState(thresholds);

@@ -31,6 +31,8 @@ export interface Scalars {
 	includeToolResults: boolean;
 	logDecisions: boolean;
 	logClassifierIo: boolean;
+	/** Ask the classifier to suggest a safer command in its refusal. Costs tokens per review. */
+	suggestAlternative: boolean;
 }
 
 export interface EvidenceLimits {
@@ -60,6 +62,7 @@ export const SCALAR_DEFAULTS: Readonly<Scalars> = Object.freeze({
 	includeToolResults: false,
 	logDecisions: true,
 	logClassifierIo: false,
+	suggestAlternative: false,
 });
 
 export const EVIDENCE_DEFAULTS: Readonly<EvidenceLimits> = Object.freeze({
@@ -163,8 +166,3 @@ export const STATE_ENTRY_TYPE = "dev.srobroek.autoclassifier.state";
 
 export const DISABLE_ENV_VAR = "OMP_AUTOCLASSIFIER_DISABLE";
 
-/**
- * Set to `1`, or to a destination path, to run the calibration matrix at session start and write the
- * report. Exists because slash commands are unreachable from print mode, CI, and from the agent itself.
- */
-export const CALIBRATE_ENV_VAR = "OMP_AUTOCLASSIFIER_CALIBRATE";

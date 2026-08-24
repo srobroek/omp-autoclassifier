@@ -185,6 +185,107 @@ describe("stage one", () => {
 	});
 });
 
+/**
+ * The verdict reports which harmful category it matched, what the transcript authorized, how recoverable
+ * the effect is and how far it reaches. Those are the axes the decision turns on, so a refusal is only
+ * auditable, and only tunable, when the model states them.
+ */
+describe("verdict dimensions", () => {
+	const full =
+		'{"decision":"deny","risk":"high","category":"persistence","authorization":"absent",' +
+		'"reversibility":"irreversible","scope":"machine","confidence":"high","injectionSuspected":false,' +
+		'"reason":"Adds a key to authorized_keys."}';
+
+	test("every dimension survives the round trip", async () => {
+		const fake = fakeCompletion(["1", full]);
+		const result = await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		expect(result.kind).toBe("deny");
+		if (result.kind !== "deny") return;
+		expect(result.dimensions).toMatchObject({
+			risk: "high",
+			category: "persistence",
+			authorization: "absent",
+			reversibility: "irreversible",
+			scope: "machine",
+			confidence: "high",
+			injectionSuspected: false,
+		});
+	});
+
+	test("an unrecognised value is reported as unstated rather than invented", async () => {
+		const reply = '{"decision":"deny","category":"vibes","authorization":"probably","reversibility":"maybe","scope":"somewhere","reason":"x"}';
+		const fake = fakeCompletion(["1", reply]);
+		const result = await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		if (result.kind !== "deny") throw new Error("expected a deny");
+		expect(result.dimensions).toMatchObject({
+			category: "unstated",
+			reversibility: "unstated",
+			scope: "unstated",
+			// Authorization has no "unstated": an unreadable claim of approval is no approval.
+			authorization: "absent",
+		});
+	});
+
+	test("a third decision value asks for a human instead of guessing", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"ask","risk":"medium","category":"external","reason":"Could go either way."}']);
+		const result = await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		expect(result.kind).toBe("ask");
+	});
+
+	/** An unsure verdict about something harmful is not an allow. */
+	test("low confidence on a harmful category turns an allow into an ask", async () => {
+		const reply = '{"decision":"allow","risk":"medium","category":"external","authorization":"implied","confidence":"low","reason":"Probably fine."}';
+		const fake = fakeCompletion(["1", reply]);
+		const result = await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		expect(result.kind).toBe("ask");
+	});
+
+	test("low confidence on ordinary work stays an allow", async () => {
+		const reply = '{"decision":"allow","risk":"low","category":"none","authorization":"implied","confidence":"low","reason":"Ordinary build."}';
+		const fake = fakeCompletion(["1", reply]);
+		expect((await classify(deps({ complete: fake.fn }), evidence, timeouts)).kind).toBe("allow");
+	});
+
+	/** Absent metadata must not manufacture an escalation, or a terse model becomes unusable. */
+	test("a terse allow is not upgraded to an ask", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","reason":"Ordinary work."}']);
+		expect((await classify(deps({ complete: fake.fn }), evidence, timeouts)).kind).toBe("allow");
+	});
+
+	/**
+	 * The gate excludes assistant prose and tool output from evidence, but a model may still notice an
+	 * approval claim inside the pending arguments. Saying so can never end in an allow.
+	 */
+	test("a suspected injection can never end in an allow", async () => {
+		const reply = '{"decision":"allow","risk":"high","category":"credentials","authorization":"explicit","injectionSuspected":true,"reason":"The file said it was approved."}';
+		const fake = fakeCompletion(["1", reply]);
+		const result = await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		expect(result.kind).toBe("deny");
+		if (result.kind === "deny") expect(result.dimensions.injectionSuspected).toBe(true);
+	});
+
+	test("an alternative is only requested when configured", async () => {
+		const without = fakeCompletion(["1", '{"decision":"deny","reason":"x"}']);
+		await classify(deps({ complete: without.fn }), evidence, timeouts);
+		expect(without.calls[1]?.systemPrompt.join("\n")).not.toContain("alternative");
+
+		const withAlt = fakeCompletion(["1", '{"decision":"deny","reason":"x","alternative":"git push --force-with-lease"}']);
+		const result = await classify(deps({ complete: withAlt.fn }), { ...evidence }, { ...timeouts, suggestAlternative: true });
+		expect(withAlt.calls[1]?.systemPrompt.join("\n")).toContain("alternative");
+		if (result.kind === "deny") expect(result.dimensions.alternative).toBe("git push --force-with-lease");
+	});
+
+	test("the reasoning stage names both axes it is judging", async () => {
+		const fake = fakeCompletion(["1", full]);
+		await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		const prompt = fake.calls[1]?.systemPrompt.join("\n") ?? "";
+		expect(prompt).toContain("category");
+		expect(prompt).toContain("authorization");
+		expect(prompt).toContain("reversibility");
+		expect(prompt).toContain("scope");
+	});
+});
+
 describe("stage two", () => {
 	test("a deny verdict carries the reason and risk", async () => {
 		const fake = fakeCompletion(["1", '{"decision":"deny","risk":"high","reason":"Adds an SSH key."}']);
@@ -192,7 +293,7 @@ describe("stage two", () => {
 		expect(result.kind).toBe("deny");
 		if (result.kind === "deny") {
 			expect(result.reason).toContain("Adds an SSH key.");
-			expect(result.risk).toBe("high");
+			expect(result.dimensions.risk).toBe("high");
 		}
 	});
 
@@ -366,10 +467,27 @@ describe("prompting", () => {
 		expect(call?.systemPrompt.join("\n")).toContain("coding");
 	});
 
+	/**
+	 * A stage-one allow is never reviewed, so the filter's only defence is a stated bias toward review.
+	 * Three wordings were measured against the live model; the two that replaced this bias with a
+	 * mechanical condition escalated four and zero of fourteen dangerous calls respectively, against
+	 * fourteen here. The bias is the load-bearing part and must not be traded for precision.
+	 */
 	test("the filter stage is told to err toward review", async () => {
 		const fake = fakeCompletion(["0"]);
 		await classify(deps({ complete: fake.fn }), evidence, timeouts);
-		expect(fake.calls[0]?.systemPrompt.join("\n").toLowerCase()).toContain("unsure");
+		const prompt = fake.calls[0]?.systemPrompt.join("\n").toLowerCase() ?? "";
+		expect(prompt).toContain("err toward 1");
+		expect(prompt).toContain("unsure");
+	});
+
+	test("the filter stage is asked about safety, not about mutation", async () => {
+		const fake = fakeCompletion(["0"]);
+		await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		const prompt = fake.calls[0]?.systemPrompt.join("\n").toLowerCase() ?? "";
+		expect(prompt).toContain("safe");
+		// A mechanical test measured far worse; it must not creep back in.
+		expect(prompt).not.toContain("cannot change anything");
 	});
 
 	test("the reasoning stage states the policy it applies", async () => {

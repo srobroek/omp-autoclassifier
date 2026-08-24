@@ -11,6 +11,9 @@
  * same wall of blocks the pause just escaped.
  */
 
+export type { Refusal } from "./evidence";
+import type { Refusal } from "./evidence";
+
 export interface Thresholds {
 	maxConsecutiveDenials: number;
 	maxTotalDenials: number;
@@ -30,6 +33,7 @@ export interface StateSnapshot {
 	consecutiveDenials: number;
 	paused: boolean;
 	degradedReason?: string;
+	refusals?: Refusal[];
 }
 
 /** Whether a model produced this decision. */
@@ -40,6 +44,15 @@ export interface Attribution {
 function counter(value: unknown): number | undefined {
 	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
 	return Math.max(0, Math.floor(value));
+}
+
+/** Enough refusals to establish a pattern; the evidence builder shows fewer still. */
+const MAX_REFUSALS = 16;
+
+function isRefusal(value: unknown): value is Refusal {
+	if (typeof value !== "object" || value === null) return false;
+	const record = value as Record<string, unknown>;
+	return typeof record.toolName === "string" && typeof record.target === "string" && typeof record.reason === "string";
 }
 
 export class GateState {
@@ -53,6 +66,7 @@ export class GateState {
 	#degradedReason: string | undefined;
 	/** Failure classes already announced this session, so a degraded gate notifies once, not per call. */
 	readonly #noticed = new Set<string>();
+	#refusals: Refusal[] = [];
 
 	constructor(thresholds: Thresholds) {
 		this.#thresholds = thresholds;
@@ -93,11 +107,33 @@ export class GateState {
 		this.#paused = true;
 	}
 
+	get refusals(): readonly Refusal[] {
+		return this.#refusals;
+	}
+
+	/**
+	 * Remember a refusal so the next review can see it.
+	 *
+	 * Denials are deliberately not cached, so that authorization given in chat takes effect immediately.
+	 * The cost is that the same request can be asked again in new words, and a live run showed an agent
+	 * doing precisely that until a fresh review passed it. This ledger is the memory that closes it.
+	 */
+	recordRefusal(toolName: string, target: string, reason: string): void {
+		const duplicate = this.#refusals.some(
+			refusal => refusal.toolName === toolName && refusal.target === target && refusal.reason === reason,
+		);
+		if (duplicate) return;
+		this.#refusals.push({ toolName, target, reason });
+		if (this.#refusals.length > MAX_REFUSALS) this.#refusals.splice(0, this.#refusals.length - MAX_REFUSALS);
+	}
+
 	resume(): void {
 		this.#paused = false;
 		this.#denied = 0;
 		this.#consecutive = 0;
 		this.#degradedReason = undefined;
+		// Resuming is the user forgiving the session; a stale history would keep arguing against them.
+		this.#refusals.length = 0;
 	}
 
 	/** True the first time a failure class is seen this session. */
@@ -117,6 +153,7 @@ export class GateState {
 			paused: this.#paused,
 		};
 		if (this.#degradedReason !== undefined) snapshot.degradedReason = this.#degradedReason;
+		if (this.#refusals.length > 0) snapshot.refusals = [...this.#refusals];
 		return snapshot;
 	}
 
@@ -131,6 +168,9 @@ export class GateState {
 		this.#consecutive = counter(record.consecutiveDenials) ?? this.#consecutive;
 		if (typeof record.paused === "boolean") this.#paused = record.paused;
 		if (typeof record.degradedReason === "string") this.#degradedReason = record.degradedReason;
+		if (Array.isArray(record.refusals)) {
+			this.#refusals = record.refusals.filter(isRefusal).slice(-MAX_REFUSALS);
+		}
 	}
 
 	#tripIfPiledUp(): void {

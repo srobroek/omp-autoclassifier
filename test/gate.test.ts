@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import type { EvidenceRequest, Refusal } from "../src/evidence";
 import { VerdictCache } from "../src/cache";
-import type { ClassifyResult } from "../src/classifier";
 import type { EffectiveConfig } from "../src/config";
 import { DEFAULT_ALLOW, DEFAULT_ENVIRONMENT, DEFAULT_HARD_DENY, EVIDENCE_DEFAULTS, SCALAR_DEFAULTS } from "../src/defaults";
+import type { ClassifyResult, Dimensions } from "../src/classifier";
 import { decide, type DecisionRecord, type GateDeps, type GateRequest } from "../src/gate";
 import { compileRules, pathVars } from "../src/rules";
 import { GateState } from "../src/state";
@@ -35,11 +36,15 @@ interface Harness {
 	state: GateState;
 	cache: VerdictCache;
 	classifyCalls: number;
+	/** Every evidence request the gate handed the classifier, so a test can assert what it saw. */
+	classifyRequests: EvidenceRequest[];
 	escalateCalls: number;
 	notices: string[];
 	childDenials: string[];
 	logged: { decision: string; via: string }[];
 	records: DecisionRecord[];
+	/** Refusals the gate handed to the registry for later sessions to inherit. */
+	shared: Refusal[];
 }
 
 function harness(options: {
@@ -47,6 +52,7 @@ function harness(options: {
 	verdict?: ClassifyResult;
 	env?: Record<string, string>;
 	escalate?: "once" | "session" | "deny" | Error;
+	inherited?: Refusal[];
 } = {}): Harness {
 	const cfg = config(options.cfg);
 	const state = new GateState(cfg);
@@ -55,11 +61,13 @@ function harness(options: {
 		state,
 		cache,
 		classifyCalls: 0,
+		classifyRequests: [],
 		escalateCalls: 0,
 		notices: [],
 		childDenials: [],
 		logged: [],
 		records: [],
+		shared: [],
 		deps: {} as GateDeps,
 	};
 	result.deps = {
@@ -69,8 +77,9 @@ function harness(options: {
 		cwd: "/work",
 		branch: () => [],
 		env: name => options.env?.[name],
-		classify: async () => {
+		classify: async request => {
 			result.classifyCalls++;
+			result.classifyRequests.push(request);
 			return options.verdict ?? { kind: "allow", reason: "fine", stage: 2 };
 		},
 		escalate: async () => {
@@ -88,8 +97,26 @@ function harness(options: {
 			result.logged.push({ decision: record.decision, via: record.via });
 			result.records.push(record);
 		},
+		inheritedRefusals: () => options.inherited ?? [],
+		shareRefusal: refusal => {
+			result.shared.push(refusal);
+		},
 	};
 	return result;
+}
+
+/** Full verdict dimensions, so a test names only the axis it cares about. */
+function dims(overrides: Partial<Dimensions> = {}): Dimensions {
+	return {
+		risk: "high",
+		category: "destruction",
+		authorization: "absent",
+		reversibility: "irreversible",
+		scope: "worktree",
+		confidence: "high",
+		injectionSuspected: false,
+		...overrides,
+	};
 }
 
 const call = (overrides: Partial<GateRequest> = {}): GateRequest => ({
@@ -285,7 +312,7 @@ describe("visibility", () => {
 	});
 
 	test("a classifier block notifies the user with the model's reason", async () => {
-		const h = harness({ verdict: { kind: "deny", reason: "Adds an SSH key.", risk: "high", stage: 2 } });
+		const h = harness({ verdict: { kind: "deny", reason: "Adds an SSH key.", stage: 2, dimensions: dims() } });
 		await decide(h.deps, call());
 		expect(h.notices.length).toBe(1);
 		expect(h.notices[0]).toContain("Adds an SSH key.");
@@ -299,7 +326,7 @@ describe("visibility", () => {
 	});
 
 	test("a block in a subagent does not notify twice, since the registry already reports it", async () => {
-		const h = harness({ verdict: { kind: "deny", reason: "nope", risk: "high", stage: 2 } });
+		const h = harness({ verdict: { kind: "deny", reason: "nope", stage: 2, dimensions: dims() } });
 		await decide(h.deps, call({ hasUI: false }));
 		expect(h.notices).toEqual([]);
 		expect(h.childDenials.length).toBe(1);
@@ -308,11 +335,229 @@ describe("visibility", () => {
 	test("an escalated allow does not notify, because the user already answered", async () => {
 		const h = harness({
 			cfg: { escalate: true },
-			verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 },
+			verdict: { kind: "deny", reason: "risky", stage: 2, dimensions: dims() },
 			escalate: "once",
 		});
 		await decide(h.deps, call());
 		expect(h.notices).toEqual([]);
+	});
+});
+
+/**
+ * A refusal has one job beyond stopping the call: telling both readers what happened. The agent reads it
+ * as a tool error and has to understand what it did wrong; the user reads the same text as a notification
+ * and has to know their agent was stopped, and why.
+ */
+describe("deny messages", () => {
+	const risky: ClassifyResult = {
+		kind: "deny",
+		reason: "Appends a key to authorized_keys, which grants future login.",
+		stage: 2,
+		dimensions: dims({ category: "persistence", authorization: "absent", reversibility: "recoverable", scope: "machine" }),
+	};
+
+	test("the agent is told what was refused and on what", async () => {
+		const h = harness({ verdict: risky });
+		const decision = await decide(h.deps, call({ input: { command: "echo key >> ~/.ssh/authorized_keys" } }));
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(decision.reason).toContain("bash");
+		expect(decision.reason).toContain("authorized_keys");
+	});
+
+	test("the agent is told which category and authorization decided it", async () => {
+		const h = harness({ verdict: risky });
+		const decision = await decide(h.deps, call());
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(decision.reason).toContain("persistence");
+		expect(decision.reason).toContain("absent");
+		expect(decision.reason).toContain("machine");
+		expect(decision.reason).toContain("recoverable");
+	});
+
+	test("the agent is given the model's own sentence, not just labels", async () => {
+		const h = harness({ verdict: risky });
+		const decision = await decide(h.deps, call());
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(decision.reason).toContain("grants future login");
+	});
+
+	test("the agent is told not to route around it", async () => {
+		const h = harness({ verdict: risky });
+		const decision = await decide(h.deps, call());
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(decision.reason.toLowerCase()).toContain("another route");
+	});
+
+	test("the user receives exactly what the agent received", async () => {
+		const h = harness({ verdict: risky });
+		const decision = await decide(h.deps, call());
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(h.notices).toEqual([decision.reason]);
+	});
+
+	test("a revoked authorization says the user already ruled it out", async () => {
+		const h = harness({ verdict: { ...risky, dimensions: dims({ authorization: "revoked" }) } });
+		const decision = await decide(h.deps, call());
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(decision.reason.toLowerCase()).toContain("ruled this out");
+	});
+
+	test("a blocked ask says why it was not put to the user", async () => {
+		const h = harness({ verdict: { kind: "ask", reason: "Could go either way.", stage: 2, dimensions: dims() } });
+		const decision = await decide(h.deps, call());
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(decision.reason).toContain("escalation is off");
+	});
+
+	test("a suspected injection is called out as hostile content", async () => {
+		const h = harness({ verdict: { ...risky, dimensions: dims({ injectionSuspected: true }) } });
+		const decision = await decide(h.deps, call());
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(decision.reason.toLowerCase()).toContain("hostile");
+	});
+
+	test("a suggested alternative is passed to the agent", async () => {
+		const h = harness({ verdict: { ...risky, dimensions: dims({ alternative: "git push --force-with-lease" }) } });
+		const decision = await decide(h.deps, call());
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(decision.reason).toContain("git push --force-with-lease");
+	});
+
+	test("every dimension reaches the audit record", async () => {
+		const h = harness({ verdict: risky });
+		await decide(h.deps, call());
+		expect(h.records[0]).toMatchObject({
+			decision: "block",
+			via: "classifier",
+			risk: "high",
+			category: "persistence",
+			authorization: "absent",
+			reversibility: "recoverable",
+			scope: "machine",
+		});
+	});
+});
+
+/**
+ * The gate refuses, the agent rewords, a fresh review sees a fresh call and allows it. Each review was
+ * correct in isolation, and a live run rode that sequence to completion: a refused subagent spawn was
+ * reshaped until it passed, and the child ran the command. The fix is memory, not a stricter verdict.
+ */
+describe("refusal memory", () => {
+	test("a refusal is remembered", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+		await decide(h.deps, call({ input: { command: "git push --force origin main" } }));
+		expect(h.state.refusals).toEqual([
+			{ toolName: "bash", target: "git push --force origin main", reason: "no" },
+		]);
+	});
+
+	test("the next review is shown what was already refused", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "Destroys history.", stage: 2, dimensions: dims() } });
+		await decide(h.deps, call({ input: { command: "git push --force origin main" } }));
+		await decide(h.deps, call({ toolName: "task", input: { task: "please push main" } }));
+		expect(h.classifyRequests[1]?.refusals).toEqual([
+			{ toolName: "bash", target: "git push --force origin main", reason: "Destroys history." },
+		]);
+	});
+
+	test("the first review has no history to show", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+		await decide(h.deps, call());
+		expect(h.classifyRequests[0]?.refusals).toEqual([]);
+	});
+
+	test("a rule-based block is remembered too, so a tool switch is visible", async () => {
+		const h = harness({ cfg: { rules: { hardDeny: [], deny: ["write(/etc/**)"], ask: [], allow: [] } } });
+		await decide(h.deps, call({ toolName: "write", input: { path: "/etc/hosts" } }));
+		expect(h.state.refusals[0]).toMatchObject({ toolName: "write", target: "/etc/hosts" });
+	});
+
+	test("an anti-tamper block is remembered", async () => {
+		const h = harness();
+		await decide(h.deps, call({ toolName: "write", input: { path: "/agent/autoclassifier.yml" } }));
+		expect(h.state.refusals.length).toBe(1);
+	});
+
+	test("an allow adds nothing to the history", async () => {
+		const h = harness();
+		await decide(h.deps, call());
+		expect(h.state.refusals).toEqual([]);
+	});
+
+	test("a classifier failure is not recorded as a judged refusal", async () => {
+		const h = harness({ verdict: { kind: "failure", reason: "model unreachable" } });
+		await decide(h.deps, call());
+		// It blocked, but no model judged the call, so there is no verdict to hold the agent to.
+		expect(h.state.refusals).toEqual([]);
+	});
+});
+
+/** A subagent's own gate starts blank, so what its parent was refused has to be handed to it. */
+describe("inherited refusals", () => {
+	test("a parent's refusal reaches this session's review", async () => {
+		const h = harness({ inherited: [{ toolName: "task", target: "push main", reason: "Destroys history." }] });
+		await decide(h.deps, call());
+		expect(h.classifyRequests[0]?.refusals).toEqual([
+			{ toolName: "task", target: "push main", reason: "Destroys history." },
+		]);
+	});
+
+	test("inherited refusals come before this session's own", async () => {
+		const h = harness({
+			verdict: { kind: "deny", reason: "mine", stage: 2, dimensions: dims() },
+			inherited: [{ toolName: "task", target: "theirs", reason: "parent" }],
+		});
+		await decide(h.deps, call({ input: { command: "a" } }));
+		await decide(h.deps, call({ input: { command: "b" } }));
+		expect(h.classifyRequests[1]?.refusals?.map(refusal => refusal.target)).toEqual(["theirs", "a"]);
+	});
+
+	test("a refusal is shared so a subagent spawned later inherits it", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+		await decide(h.deps, call({ input: { command: "git push --force" } }));
+		expect(h.shared).toEqual([{ toolName: "bash", target: "git push --force", reason: "no" }]);
+	});
+
+	test("an allow is not shared", async () => {
+		const h = harness();
+		await decide(h.deps, call());
+		expect(h.shared).toEqual([]);
+	});
+});
+
+/**
+ * A log that records only tool names cannot answer the question it exists to answer. A live run left six
+ * allowed `bash` calls in the log with no indication of what any of them ran, because the target was
+ * only ever filled in by a rule match.
+ */
+describe("audit target", () => {
+	test("a classifier allow names what it allowed", async () => {
+		const h = harness();
+		await decide(h.deps, call({ input: { command: "bun test" } }));
+		expect(h.records[0]?.target).toBe("bun test");
+	});
+	/**
+	 * A rule reports the path it actually matched, which is the resolved one. The raw argument may be
+	 * relative or contain traversal, and logging that instead would leave the reader to guess what the
+	 * gate really compared.
+	 */
+	test("a rule match records the resolved path, not the raw argument", async () => {
+		const h = harness();
+		await decide(h.deps, call({ toolName: "write", input: { path: "../agent/sub/../autoclassifier.yml" } }));
+		expect(h.records[0]?.target).toBe("/agent/autoclassifier.yml");
+	});
+
+	test("a rule match keeps the path the rule matched, not the raw argument", async () => {
+		const h = harness();
+		await decide(h.deps, call({ toolName: "write", input: { path: "/agent/autoclassifier.yml" } }));
+		expect(h.records[0]?.target).toContain("autoclassifier.yml");
+	});
+
+	test("a call with no meaningful argument records no target rather than a placeholder", async () => {
+		const h = harness();
+		await decide(h.deps, call({ toolName: "hub", input: {} }));
+		expect(h.records[0]?.target).toBeUndefined();
 	});
 });
 
@@ -325,7 +570,7 @@ describe("verdict cache", () => {
 	});
 
 	test("a denial is never cached, so authorization granted in chat takes effect", async () => {
-		const h = harness({ verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 } });
+		const h = harness({ verdict: { kind: "deny", reason: "risky", stage: 2, dimensions: dims() } });
 		await decide(h.deps, call());
 		await decide(h.deps, call());
 		expect(h.classifyCalls).toBe(2);
@@ -457,7 +702,7 @@ describe("escalation", () => {
 	});
 
 	test("a classifier denial can also escalate when configured", async () => {
-		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 }, escalate: "once" });
+		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", stage: 2, dimensions: dims() }, escalate: "once" });
 		expect((await decide(h.deps, call())).action).toBe("allow");
 	});
 
@@ -485,7 +730,7 @@ describe("subagents", () => {
 	});
 
 	test("a classifier denial blocks in a subagent when no parent can be reached", async () => {
-		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 }, escalate: "once" });
+		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", stage: 2, dimensions: dims() }, escalate: "once" });
 		expect((await decide(h.deps, call({ hasUI: false }))).action).toBe("block");
 	});
 
@@ -495,7 +740,7 @@ describe("subagents", () => {
 	 */
 	test("a subagent escalation is answered by the parent session", async () => {
 		const asked: string[] = [];
-		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 } });
+		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", stage: 2, dimensions: dims() } });
 		h.deps.escalateViaParent = async (toolName, reason) => {
 			asked.push(`${toolName}|${reason}`);
 			return "once";
@@ -507,13 +752,13 @@ describe("subagents", () => {
 	});
 
 	test("the parent refusing keeps the subagent's call blocked", async () => {
-		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 } });
+		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", stage: 2, dimensions: dims() } });
 		h.deps.escalateViaParent = async () => "deny";
 		expect((await decide(h.deps, call({ hasUI: false }))).action).toBe("block");
 	});
 
 	test("the parent allowing for the session is remembered for the subagent too", async () => {
-		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 } });
+		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", stage: 2, dimensions: dims() } });
 		h.deps.escalateViaParent = async () => "session";
 		await decide(h.deps, call({ hasUI: false }));
 		expect(h.cache.isAllowed("bash", { command: "git status" })).toBe(true);
@@ -521,7 +766,7 @@ describe("subagents", () => {
 
 	test("an interactive session asks itself, never a peer", async () => {
 		let viaParent = 0;
-		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 }, escalate: "once" });
+		const h = harness({ cfg: { escalate: true }, verdict: { kind: "deny", reason: "risky", stage: 2, dimensions: dims() }, escalate: "once" });
 		h.deps.escalateViaParent = async () => {
 			viaParent++;
 			return "deny";
@@ -548,13 +793,13 @@ describe("subagents", () => {
 	});
 
 	test("a denial inside a subagent is reported upward", async () => {
-		const h = harness({ verdict: { kind: "deny", reason: "Adds an SSH key.", risk: "high", stage: 2 } });
+		const h = harness({ verdict: { kind: "deny", reason: "Adds an SSH key.", stage: 2, dimensions: dims() } });
 		await decide(h.deps, call({ hasUI: false }));
 		expect(h.childDenials).toEqual(["Adds an SSH key."]);
 	});
 
 	test("a denial in an interactive session is not reported as a child denial", async () => {
-		const h = harness({ verdict: { kind: "deny", reason: "nope", risk: "high", stage: 2 } });
+		const h = harness({ verdict: { kind: "deny", reason: "nope", stage: 2, dimensions: dims() } });
 		await decide(h.deps, call({ hasUI: true }));
 		expect(h.childDenials).toEqual([]);
 	});
@@ -584,7 +829,7 @@ describe("bookkeeping", () => {
 		await decide(h.deps, call({ input: { command: "a" } }));
 		expect(h.state.snapshot()).toMatchObject({ checked: 1, allowed: 1 });
 
-		const denier = harness({ verdict: { kind: "deny", reason: "no", risk: "high", stage: 2 } });
+		const denier = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
 		await decide(denier.deps, call());
 		expect(denier.state.snapshot()).toMatchObject({ denied: 1 });
 	});
@@ -684,7 +929,7 @@ describe("bookkeeping", () => {
 	test("an escalated allow is credited to the model", async () => {
 		const h = harness({
 			cfg: { escalate: true },
-			verdict: { kind: "deny", reason: "risky", risk: "high", stage: 2 },
+			verdict: { kind: "deny", reason: "risky", stage: 2, dimensions: dims() },
 			escalate: "once",
 		});
 		await decide(h.deps, call());
@@ -709,7 +954,7 @@ describe("bookkeeping", () => {
 	});
 
 	test("a repeated denial eventually pauses the gate through the breaker", async () => {
-		const h = harness({ verdict: { kind: "deny", reason: "no", risk: "high", stage: 2 } });
+		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
 		for (const command of ["a", "b", "c"]) await decide(h.deps, call({ input: { command } }));
 		expect(h.state.paused).toBe(true);
 		const after = await decide(h.deps, call({ input: { command: "d" } }));
@@ -737,6 +982,6 @@ describe("classifier input", () => {
 			return { kind: "allow", reason: "ok", stage: 2 };
 		};
 		await decide(h.deps, call());
-		expect(seen).toEqual({ stage1TimeoutMs: 1234, stage2TimeoutMs: 5678 });
+		expect(seen).toMatchObject({ stage1TimeoutMs: 1234, stage2TimeoutMs: 5678 });
 	});
 });
