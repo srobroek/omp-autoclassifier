@@ -26,7 +26,8 @@
 		"skills",
 		"LICENSE",
 		"NOTICE",
-		"README.md"
+		"README.md",
+		"CHANGELOG.md"
 	],
 	"omp": {
 		"name": "omp-autoclassifier",
@@ -117,8 +118,6 @@
 		}
 	},
 	"devDependencies": {
-		"@changesets/changelog-github": "^1.0.0",
-		"@changesets/cli": "^3.0.1",
 		"@types/bun": "^1.4.0",
 		"omp-host": "npm:@oh-my-pi/pi-coding-agent@18.0.4",
 		"omp-host-ai": "npm:@oh-my-pi/pi-ai@18.0.4",
@@ -128,8 +127,7 @@
 		"check": "tsc --noEmit",
 		"test": "bun test",
 		"test:mutate": "bun run test/mutate.ts",
-		"verify": "bun run check && bun test && bun run test:mutate",
-		"changeset:version": "changeset version && bun install --lockfile-only"
+		"verify": "bun run check && bun test && bun run test:mutate"
 	},
 	"engines": {
 		"bun": ">=1.2.0"

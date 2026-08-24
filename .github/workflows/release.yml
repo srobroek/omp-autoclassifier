@@ -8,27 +8,44 @@ concurrency:
   group: release
   cancel-in-progress: false
 
-permissions:
-  contents: write
-  pull-requests: write
-  # Required for npm trusted publishing: npm exchanges this OIDC token for a
-  # short-lived credential, so no long-lived NPM_TOKEN exists anywhere.
-  id-token: write
-
 jobs:
-  release:
+  # Keeps a release PR up to date from the Conventional Commits on main. Merging
+  # that PR is what tags the release and triggers publishing below.
+  prepare:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      released: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish:
+    needs: prepare
+    if: needs.prepare.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for npm trusted publishing: npm exchanges this OIDC token for a
+      # short-lived credential, so no long-lived NPM_TOKEN exists anywhere.
+      id-token: write
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
-      # npm itself performs the publish, so it needs a Node toolchain with a
-      # version new enough for OIDC (npm >= 11.5.1, shipped with Node >= 22.14).
+      # npm performs the publish, so it needs a Node toolchain new enough for
+      # OIDC trusted publishing (npm >= 11.5.1, shipped with Node >= 22.14).
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
@@ -37,18 +54,12 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
-      - name: Verify before releasing
+      # The tag is already cut, so this is the last chance to catch a bad release.
+      - name: Verify the tagged tree
         run: bun run verify
 
-      - name: Open a version PR, or publish when one lands
-        uses: changesets/action@v1
-        with:
-          version: bun run changeset:version
-          publish: npm publish --access public
-          commit: "chore: release"
-          title: "chore: release"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Deliberately no NODE_AUTH_TOKEN: trusted publishing uses the OIDC
-          # token above. Setting one here would silently take precedence and
-          # publish without provenance.
+      - name: Publish to npm with provenance
+        run: npm publish --access public
+        # Deliberately no NODE_AUTH_TOKEN: trusted publishing uses the OIDC token
+        # above. Setting one would silently take precedence and publish without
+        # provenance.
