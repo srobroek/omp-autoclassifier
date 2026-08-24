@@ -170,6 +170,32 @@ const rulesMutations: Mutation[] = [
 		to: "\tif (!matcher.schemeAware && remoteTargets().length > 0) return false;",
 		expect: "never weakens a deny",
 	},
+	{
+		// The live failure this was written for: every internal omp URL read as remote, so a degraded
+		// classifier blocked the agent from reading its own skills and plan files.
+		name: "internal omp urls treated as remote",
+		from: "const REMOTE_SCHEME_RE = /^(?:ssh|https?|xd):\\/\\//i;",
+		to: "const REMOTE_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\\/\\//i;",
+		expect: "internal omp urls are not treated as remote",
+	},
+	{
+		name: "network egress treated as local",
+		from: "const REMOTE_SCHEME_RE = /^(?:ssh|https?|xd):\\/\\//i;",
+		to: "const REMOTE_SCHEME_RE = /^(?:ssh|xd):\\/\\//i;",
+		expect: "leave the machine or dispatch a tool",
+	},
+	{
+		name: "device dispatch treated as local",
+		from: "const REMOTE_SCHEME_RE = /^(?:ssh|https?|xd):\\/\\//i;",
+		to: "const REMOTE_SCHEME_RE = /^(?:ssh|https?):\\/\\//i;",
+		expect: "leave the machine or dispatch a tool",
+	},
+	{
+		name: "scheme matching becomes case sensitive",
+		from: "const REMOTE_SCHEME_RE = /^(?:ssh|https?|xd):\\/\\//i;",
+		to: "const REMOTE_SCHEME_RE = /^(?:ssh|https?|xd):\\/\\//;",
+		expect: "scheme comparison ignores case",
+	},
 ];
 
 const cacheMutations: Mutation[] = [
@@ -417,10 +443,24 @@ const evidenceMutations: Mutation[] = [
 
 const classifierMutations: Mutation[] = [
 	{
-		name: "a missing classifier role falls back to the session model",
-		from: '\tif (model === undefined) return { kind: "unconfigured" };',
-		to: '\tif (model === undefined) model = { provider: "fallback", id: "session" };',
-		expect: "unconfigured",
+		name: "a missing classifier role falls back to a session model",
+		from: '\tif (configured === undefined || configured.length === 0) return { kind: "unconfigured" };',
+		to: "",
+		expect: "no configured role means unconfigured",
+	},
+	{
+		// The live failure this was written for: a decommissioned or mistyped model id read as an opt-out
+		// and switched the gate off while the status line still claimed to be armed.
+		name: "an unresolvable configured role reads as unconfigured",
+		from: "\tif (model === undefined) {\n\t\treturn {\n\t\t\tkind: \"failure\",",
+		to: "\tif (model === undefined) {\n\t\treturn {\n\t\t\tkind: \"unconfigured\" as \"failure\",",
+		expect: "configured role that does not resolve fails closed",
+	},
+	{
+		name: "a whitespace-only role counts as configured",
+		from: "\t\tconfigured = deps.configuredRole()?.trim();",
+		to: "\t\tconfigured = deps.configuredRole();",
+		expect: "empty role string counts as unconfigured",
 	},
 	{
 		name: "missing credentials no longer fail closed",

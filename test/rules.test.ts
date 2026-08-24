@@ -253,6 +253,41 @@ describe("url-scheme targets", () => {
 	test("a remote target never weakens a deny", () => {
 		expect(match({ deny: ["read"] }, "read", { path: "ssh://host/x" })).toBe("deny");
 	});
+
+	/**
+	 * omp's `read` accepts internal URLs that never leave the machine: `skill://`, `local://`, `omp://`,
+	 * `memory://`, and friends. Treating those like a remote target sends the agent's own skills and plan
+	 * files to the classifier, and a degraded classifier then blocks the agent from reading them.
+	 */
+	test("internal omp urls are not treated as remote", () => {
+		const l = { allow: ["read"] };
+		for (const target of [
+			"skill://write-docs",
+			"rule://go-language",
+			"local://plan.md",
+			"omp://extensions.md",
+			"memory://abc123",
+			"artifact://a1",
+			"agent://Scout",
+			"history://x",
+		]) {
+			expect(match(l, "read", { path: target })).toBe("allow");
+		}
+	});
+
+	/** These genuinely leave the machine, or dispatch another tool. */
+	test("targets that leave the machine or dispatch a tool are not fast-pathed", () => {
+		const l = { allow: ["read", "write"] };
+		expect(match(l, "read", { path: "ssh://host/etc/passwd" })).toBeUndefined();
+		expect(match(l, "read", { path: "https://evil.test/x" })).toBeUndefined();
+		expect(match(l, "read", { path: "http://evil.test/x" })).toBeUndefined();
+		expect(match(l, "write", { path: "xd://ast_edit" })).toBeUndefined();
+	});
+
+	test("scheme comparison ignores case", () => {
+		expect(match({ allow: ["read"] }, "read", { path: "SSH://host/x" })).toBeUndefined();
+		expect(match({ allow: ["read"] }, "read", { path: "SKILL://x" })).toBe("allow");
+	});
 });
 
 describe("expandDefaults", () => {

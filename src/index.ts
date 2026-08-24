@@ -243,6 +243,7 @@ export default function autoclassifier(pi: ExtensionAPI): void {
 			env: name => process.env[name],
 			classify: async (request, timeouts) => {
 				const classifierDeps: ClassifierDeps = {
+					configuredRole: classifierRole,
 					resolveModel: spec => ctx.models.resolve(spec),
 					resolveAuth: async model => ctx.modelRegistry.getApiKeyAndHeaders(model as Model),
 					complete: await loadCompletion(),

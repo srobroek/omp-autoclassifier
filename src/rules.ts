@@ -50,8 +50,23 @@ export function primaryArgument(toolName: string, input: unknown): string {
 	return "";
 }
 
-/** A URL-scheme target (`ssh://`, `xd://`, `local://`, …) is never a local filesystem path. */
+/** Any URL-scheme target. None of these is a local filesystem path, so none gets path-resolved. */
 const SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+/**
+ * Schemes that disqualify a fast-path allow, because the operation leaves this machine or dispatches
+ * another tool:
+ *
+ *   - `ssh://`          omp promotes `read` and `grep` to `exec` tier; the work runs on another host
+ *   - `http(s)://`      network egress, so a data channel out of the workspace
+ *   - `xd://`           a `write` to a device URL executes the mounted tool instead of writing a file
+ *
+ * omp's other schemes (`skill://`, `rule://`, `local://`, `omp://`, `memory://`, `artifact://`,
+ * `agent://`, `history://`) resolve inside the process. Treating those as remote would push the agent's
+ * own skills and plan files through the classifier for nothing, and a degraded classifier would then
+ * block it from reading them.
+ */
+const REMOTE_SCHEME_RE = /^(?:ssh|https?|xd):\/\//i;
 
 const HASHLINE_TAG_RE = /#[0-9a-fA-F]{4}$/u;
 
@@ -107,11 +122,12 @@ function pathFields(input: unknown): string[] {
 }
 
 /**
- * Targets that name a URL scheme, for any tool. Checked independently of the primary-argument table
- * because `grep`'s rule pattern matches its search pattern while its remote-ness lives in `path`.
+ * Targets that leave this machine or dispatch another tool, for any tool. Checked independently of the
+ * primary-argument table because `grep`'s rule pattern matches its search pattern while its remoteness
+ * lives in `path`.
  */
 export function remoteTargets(input: unknown): string[] {
-	return pathFields(input).filter(target => SCHEME_RE.test(target));
+	return pathFields(input).filter(target => REMOTE_SCHEME_RE.test(target));
 }
 
 function globToRegExp(pattern: string): RegExp {

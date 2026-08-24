@@ -59,6 +59,14 @@ export type ResolvedAuth =
 	| { ok: false; error: string };
 
 export interface ClassifierDeps {
+	/**
+	 * The raw `modelRoles.classifier` value, or undefined when the user has never set one.
+	 *
+	 * Separate from `resolveModel` because the two failures mean opposite things: no role at all is an
+	 * opt-out, while a role naming a model the registry cannot resolve is a misconfiguration that has to
+	 * fail closed.
+	 */
+	configuredRole: () => string | undefined;
 	/** Resolves a model spec or `@role` alias, exactly as `ctx.models.resolve` does. */
 	resolveModel: (spec: string) => ClassifierModel | undefined;
 	resolveAuth: (model: ClassifierModel) => Promise<ResolvedAuth>;
@@ -227,13 +235,28 @@ export async function classify(
 	request: EvidenceRequest,
 	timeouts: Timeouts,
 ): Promise<ClassifyResult> {
+	let configured: string | undefined;
+	try {
+		configured = deps.configuredRole()?.trim();
+	} catch {
+		configured = undefined;
+	}
+	if (configured === undefined || configured.length === 0) return { kind: "unconfigured" };
+
 	let model: ClassifierModel | undefined;
 	try {
 		model = deps.resolveModel(CLASSIFIER_ROLE);
 	} catch (error) {
 		return { kind: "failure", reason: `resolving the classifier model failed: ${describe(error)}` };
 	}
-	if (model === undefined) return { kind: "unconfigured" };
+	// A role that names a model the registry cannot resolve is a misconfiguration, not an opt-out: a
+	// decommissioned id or a typo must not quietly switch the gate off.
+	if (model === undefined) {
+		return {
+			kind: "failure",
+			reason: `the configured classifier model \`${configured}\` could not be resolved; check \`modelRoles.classifier\``,
+		};
+	}
 
 	let auth: ResolvedAuth;
 	try {

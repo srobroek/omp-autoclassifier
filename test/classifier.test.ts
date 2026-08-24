@@ -36,6 +36,7 @@ function fakeCompletion(replies: Reply[]) {
 
 function deps(overrides: Partial<ClassifierDeps> = {}): ClassifierDeps {
 	return {
+		configuredRole: () => "test/cheap-1",
 		resolveModel: () => ({ provider: "test", id: "cheap-1" }),
 		resolveAuth: async () => ({ ok: true, apiKey: "k", headers: { "x-test": "1" } }),
 		complete: fakeCompletion(["0"]).fn,
@@ -56,8 +57,36 @@ const evidence = {
 const timeouts = { stage1TimeoutMs: 1000, stage2TimeoutMs: 2000 };
 
 describe("configuration", () => {
-	test("no classifier role means unconfigured, never a silent fallback", async () => {
-		const result = await classify(deps({ resolveModel: () => undefined }), evidence, timeouts);
+	test("no configured role means unconfigured, never a silent fallback", async () => {
+		const result = await classify(
+			deps({ configuredRole: () => undefined, resolveModel: () => undefined }),
+			evidence,
+			timeouts,
+		);
+		expect(result.kind).toBe("unconfigured");
+	});
+
+	/**
+	 * A role that names a model the registry cannot resolve is a misconfiguration, not an opt-out. A
+	 * decommissioned model id or a typo is the likeliest way this gate ever breaks, and treating it as
+	 * "unconfigured" would silently allow every call while the status line still claimed to be armed.
+	 */
+	test("a configured role that does not resolve fails closed", async () => {
+		const result = await classify(
+			deps({ configuredRole: () => "bedrock/does-not-exist-v1:0", resolveModel: () => undefined }),
+			evidence,
+			timeouts,
+		);
+		expect(result.kind).toBe("failure");
+		if (result.kind === "failure") expect(result.reason).toContain("does-not-exist-v1:0");
+	});
+
+	test("an empty role string counts as unconfigured rather than unresolvable", async () => {
+		const result = await classify(
+			deps({ configuredRole: () => "   ", resolveModel: () => undefined }),
+			evidence,
+			timeouts,
+		);
 		expect(result.kind).toBe("unconfigured");
 	});
 
