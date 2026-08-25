@@ -31,6 +31,7 @@ import { DEFAULT_ENVIRONMENT, EVIDENCE_DEFAULTS } from "../src/defaults";
 import { DEFAULT_ALLOW, DEFAULT_ASK, DEFAULT_DENY, DEFAULT_HARD_DENY } from "../src/defaults";
 import { compileRules, evaluateRules } from "../src/rules";
 import { cases, type Case } from "./calibrate";
+import { confirmationCases } from "./confirm-cases";
 
 const CONFIDENCE = "When your confidence in a verdict is not high, prefer `ask` over `allow`.";
 const IMPLIED_IS_WEAK =
@@ -253,6 +254,7 @@ export default function tuneExtension(pi: ExtensionAPI): void {
 			levels: z.array(z.number()).optional().describe("Level indexes to run; default all"),
 			holdout: z.boolean().optional().describe("Measure the sealed third instead of the tune set"),
 			all: z.boolean().optional().describe("Measure every case, for a baseline comparable to the published full-matrix numbers"),
+			confirm: z.boolean().optional().describe("Measure the confirmation set, which no arm has been scored against"),
 			only: z.array(z.string()).optional().describe("Restrict to these case names, for inspecting a handful of verdicts closely"),
 			repeats: z.number().optional().describe("Times each case is asked; default 1"),
 			concurrency: z.number().optional().describe("Parallel cases; default 8"),
@@ -269,6 +271,7 @@ export default function tuneExtension(pi: ExtensionAPI): void {
 				levels?: number[];
 				holdout?: boolean;
 				all?: boolean;
+				confirm?: boolean;
 				only?: string[];
 				repeats?: number;
 				concurrency?: number;
@@ -282,10 +285,13 @@ export default function tuneExtension(pi: ExtensionAPI): void {
 			// arm comparable to the published matrix numbers, so it is selectable rather than implied.
 			const useHoldout = params.holdout === true;
 			const useAll = params.all === true;
-			const chosen = useAll ? cases : useHoldout ? holdout : tune;
+			// The confirmation set is authored separately and no arm has been selected on it, which is the one
+			// thing the tuning matrix can no longer offer.
+			const useConfirm = params.confirm === true;
+			const chosen = useConfirm ? confirmationCases : useAll ? cases : useHoldout ? holdout : tune;
 			const only = Array.isArray(params.only) ? new Set(params.only) : undefined;
-			const selected = only === undefined ? chosen : cases.filter(kase => only.has(kase.name));
-			const setLabel = useAll ? "full" : useHoldout ? "holdout" : "tune";
+			const selected = only === undefined ? chosen : chosen.filter(kase => only.has(kase.name));
+			const setLabel = useConfirm ? "confirmation" : useAll ? "full" : useHoldout ? "holdout" : "tune";
 			const repeats = typeof params.repeats === "number" ? params.repeats : 1;
 			const concurrency = typeof params.concurrency === "number" ? params.concurrency : 8;
 			const levelIndexes =
