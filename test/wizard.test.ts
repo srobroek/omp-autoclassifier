@@ -20,8 +20,10 @@ describe("candidate ranking", () => {
 	 * on none. Recommending the cheapest model was recommending the leakiest one.
 	 */
 	test("a measured model outranks the user own cheap role", () => {
-		const models = [model("gpt-5.6-luna"), model("claude-haiku-4-5")];
-		const ranked = rankCandidates(models, { roles: { smol: "prov/gpt-5.6-luna", tiny: "prov/gpt-5.6-luna" } });
+		// Not `luna` itself: the matrix later disqualified it outright, so the demotion below would
+		// produce this order even with the measured list gone, and the assertion would prove nothing.
+		const models = [model("gpt-mini"), model("claude-haiku-4-5")];
+		const ranked = rankCandidates(models, { roles: { smol: "prov/gpt-mini", tiny: "prov/gpt-mini" } });
 		expect(ranked[0]?.id).toBe("claude-haiku-4-5");
 	});
 
@@ -70,10 +72,38 @@ describe("candidate ranking", () => {
 	});
 
 	test("every known cheap naming convention is recognized", () => {
-		for (const id of ["x-haiku-1", "gpt-mini", "gemini-flash", "llama-lite", "gpt-luna", "phi-small"]) {
+		for (const id of ["x-haiku-1", "gpt-mini", "gemini-flash", "llama-lite", "phi-small"]) {
 			const ranked = rankCandidates([model("mystery"), model(id)], { roles: {} });
 			expect(ranked[0]?.id).toBe(id);
 		}
+	});
+
+	/**
+	 * `luna` was in the cheap-name list until the full matrix measured it: 35 escapes of 579 verdicts
+	 * against haiku's 3. A naming convention that promotes the worst measured model is worse than no
+	 * convention, so a measured refusal outranks a cheap name in both directions.
+	 */
+	test("a model the matrix disqualified is ranked below an unknown one", () => {
+		const ranked = rankCandidates([model("gpt-5.6-luna"), model("gpt-mystery")], { roles: {} });
+		expect(ranked[0]?.id).toBe("gpt-mystery");
+	});
+
+	test("a disqualified model is not promoted by a cheap role either", () => {
+		const ranked = rankCandidates([model("gpt-5.6-luna"), model("gpt-mystery")], {
+			roles: { smol: "prov/gpt-5.6-luna" },
+		});
+		expect(ranked[0]?.id).toBe("gpt-mystery");
+	});
+
+	/** Anthropic and OpenAI are the two families this gate supports reviewing with. */
+	test("only anthropic and openai models are offered", () => {
+		const models = [model("nova-lite"), model("llama4-scout"), model("claude-haiku-4-5"), model("gpt-5.4")];
+		expect(ids(rankCandidates(models, { roles: {} }))).toEqual(["claude-haiku-4-5", "gpt-5.4"]);
+	});
+
+	test("an account with neither family still gets a list rather than an empty picker", () => {
+		const models = [model("nova-lite"), model("llama4-scout")];
+		expect(ids(rankCandidates(models, { roles: {} }))).toEqual(["nova-lite", "llama4-scout"]);
 	});
 
 	/**
@@ -82,18 +112,19 @@ describe("candidate ranking", () => {
 	 */
 	test("an expensive sibling of the session model is pushed down", () => {
 		const current = model("claude-opus-5");
-		const models = [current, model("claude-opus-5-thinking"), model("unrelated-model")];
+		// Named inside a supported family: an out-of-family placeholder is filtered before ranking.
+		const models = [current, model("claude-opus-5-thinking"), model("gpt-unrelated")];
 		const ranked = rankCandidates(models, {
 			roles: {},
 			current,
 			family: candidate => (candidate.id.startsWith("claude") ? "claude" : candidate.id),
 		});
-		expect(ranked[0]?.id).toBe("unrelated-model");
+		expect(ranked[0]?.id).toBe("gpt-unrelated");
 	});
 
 	test("a cheap sibling of the session model is still a fine suggestion", () => {
 		const current = model("claude-opus-5");
-		const models = [current, model("claude-haiku-4-5"), model("unrelated-model")];
+		const models = [current, model("claude-haiku-4-5"), model("gpt-unrelated")];
 		const ranked = rankCandidates(models, {
 			roles: {},
 			current,
@@ -104,7 +135,7 @@ describe("candidate ranking", () => {
 
 	test("a trusted cheap role outranks the family penalty", () => {
 		const current = model("claude-opus-5");
-		const models = [current, model("claude-haiku-4-5"), model("unrelated")];
+		const models = [current, model("claude-haiku-4-5"), model("gpt-unrelated")];
 		const ranked = rankCandidates(models, {
 			roles: { smol: "prov/claude-haiku-4-5" },
 			current,
@@ -115,8 +146,8 @@ describe("candidate ranking", () => {
 
 	test("the session model itself is never the top suggestion when anything else exists", () => {
 		const current = model("claude-opus-5");
-		const ranked = rankCandidates([current, model("other")], { roles: {}, current });
-		expect(ranked[0]?.id).toBe("other");
+		const ranked = rankCandidates([current, model("gpt-other")], { roles: {}, current });
+		expect(ranked[0]?.id).toBe("gpt-other");
 	});
 
 	test("every model is offered, so an unusual setup is not left with an empty list", () => {

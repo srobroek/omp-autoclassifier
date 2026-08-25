@@ -217,6 +217,42 @@ const rulesMutations: Mutation[] = [
 		expect: "never weakens a deny",
 	},
 	{
+		name: "command links no longer split, so a chained call is judged by its first link",
+		from: '\tif (COMMAND_TOOLS[toolName] === true && !matcher.operatorAware) {',
+		to: "\tif (false) {",
+		expect: "does not fast-path a command with more links",
+	},
+	{
+		name: "one matching link is enough to allow the whole command",
+		from: "\t\t\t\treturn links.every(link => arg.test(link)) ? { target: describeTarget(links[0]) } : undefined;",
+		to: "\t\t\t\treturn links.some(link => arg.test(link)) ? { target: describeTarget(links[0]) } : undefined;",
+		expect: "does not fast-path a command with more links",
+	},
+	{
+		name: "a deny stops looking past the first link",
+		from: "\t\t\tconst hit = links.find(link => arg.test(link));",
+		to: "\t\t\tconst hit = links[0] !== undefined && arg.test(links[0]) ? links[0] : undefined;",
+		expect: "never weakens a deny",
+	},
+	{
+		name: "an operator in the rule is not recognised, so a deliberate compound rule stops working",
+		from: "\t\toperatorAware: OPERATOR_PRESENT_RE.test(expanded),",
+		to: "\t\toperatorAware: false,",
+		expect: "spells out the operator still applies",
+	},
+	{
+		name: "substitution bodies are no longer extracted as links",
+		from: "\tconst stripped = value.replace(SUBSTITUTION_RE, (_match, dollar: string | undefined, tick: string | undefined) => {",
+		to: "\tconst stripped = value.replace(/$^/g, (_match, dollar: string | undefined, tick: string | undefined) => {",
+		expect: "covers substitution as well as chaining",
+	},
+	{
+		name: "the global substitution regex is reused as a predicate, so awareness alternates",
+		from: "const OPERATOR_PRESENT_RE = /&&|\\|\\||[;\\n|]|\\$\\(|`/;",
+		to: "const OPERATOR_PRESENT_RE = /&&|\\|\\||[;\\n|]/;",
+		expect: "spells out a substitution is taken at its word",
+	},
+	{
 		// The live failure this was written for: every internal omp URL read as remote, so a degraded
 		// classifier blocked the agent from reading its own skills and plan files.
 		name: "internal omp urls treated as remote",
@@ -1210,6 +1246,30 @@ const logMutations: Mutation[] = [
 ];
 
 const wizardMutations: Mutation[] = [
+	{
+		name: "a disqualified model is no longer demoted",
+		from: "	if (MEASURED_WORST.some(pattern => pattern.test(model.id) || pattern.test(model.name))) {",
+		to: "	if (false) {",
+		expect: "disqualified is ranked below an unknown one",
+	},
+	{
+		name: "the demotion no longer short-circuits ahead of the cheap-role promotion",
+		from: "		return MEASURED_BEST.length + 4;",
+		to: "		void model;",
+		expect: "not promoted by a cheap role either",
+	},
+	{
+		name: "unsupported families are offered again",
+		from: "	const offered = supported.length > 0 ? supported : models;",
+		to: "	const offered = models;",
+		expect: "only anthropic and openai models are offered",
+	},
+	{
+		name: "an account with no supported family gets an empty picker",
+		from: "	const offered = supported.length > 0 ? supported : models;",
+		to: "	const offered = supported;",
+		expect: "rather than an empty picker",
+	},
 	{
 		/** Without this, cheapness wins again and the wizard recommends the leakiest model measured. */
 		name: "measurement no longer outranks cheapness",

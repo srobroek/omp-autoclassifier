@@ -24,32 +24,70 @@ export interface RankOptions {
 }
 
 /**
- * Models measured on this gate's own matrix, best first. Ranked above every heuristic below, because a
+ * Models confirmed on this gate's own matrix, best first. Ranked above every heuristic below, because a
  * measurement beats a naming convention.
  *
- * From 193 cases at three repeats, `temperature: 0`, majority verdict. The column that decides a security
- * gate is how much harm it let through, and it does not track the others:
+ * Entry requires the full matrix: 193 cases, three repeats, `temperature: 0`, the shipped request shape.
+ * Short runs do not qualify a model however good they look, and that rule has already earned its keep.
  *
- *   model               harm allowed   unstable   effective   median   p95
- *   claude-haiku-4-5               0     0/193     185/193   3449ms  4845ms
- *   claude-sonnet-5                7         --     186/193   4516ms  9560ms
- *   gpt-5.6-luna                  13    12/193     179/193   1755ms  3131ms
- *   gpt-5.6-terra                 14         --     179/193   1866ms  3952ms
+ * Measured, 579 verdicts each. The column that decides a security gate is how much harm it allowed:
  *
- * `terra` scored highest of the four on exact matching and allowed the most harm, so exact matching is
- * not the metric. `haiku` costs about 1.7s more per verdict than `luna` and lets nothing through, which is
- * the trade this gate exists to make.
+ *   model               harm allowed   wrong   median   $/1k verdicts
+ *   claude-haiku-4-5               3      27   2322ms          $2.83
+ *   llama4-scout                  30      69   1194ms          $0.51
+ *   gpt-5.6-luna                  35      42   2216ms          $0.47
  *
- * One account, one prompt revision, one matrix. Re-measure with `ac_model_bakeoff` before trusting the
- * order, and treat an unlisted model as unknown rather than bad.
+ * `llama4-scout` is the reason for the entry rule. Over 33 cases it allowed **nothing** through, at half
+ * haiku's latency and a fifth of its cost, and it topped every short ranking. Over 193 it allows ten times
+ * as much harm as haiku. The short sample did not contain the calls it gets wrong, and no amount of repeats
+ * would have found them, because repeats resample the same prompts.
+ *
+ * `haiku` costs five times more per verdict and is the only entry. A gate that lets thirty dangerous calls
+ * through is not cheaper, it is broken.
+ *
+ * **The list is ordered, not universal.** `haiku` is an Anthropic model, so an account without Anthropic
+ * credentials never matches it and falls through to the heuristics below. That is the intended degradation
+ * and also a real gap. No OpenAI model qualifies:
+ *
+ *   gpt-5.6-luna    35 of 193, three repeats   confirmed, disqualifying
+ *   gpt-5.6-terra   14 of a 33-case sample     unconfirmed, and 33 cases means nothing here
+ *
+ * Do not read terra's 14 as better than luna's 35. `llama4-scout` allowed nothing over 33 cases and thirty
+ * over 193, so a 33-case figure carries no information about full-matrix behaviour. An OpenAI-only account
+ * gets a heuristic pick, and finding a measured model for that case is open work.
+ *
+ * One account, one prompt revision, one matrix. Re-measure with `ac_rank` at `sample 1, repeats 3` before
+ * trusting the order, and treat an unlisted model as unknown rather than bad.
  */
-const MEASURED_BEST = [/claude-haiku-4-5/i, /claude-sonnet-5/i];
+const MEASURED_BEST = [/claude-haiku-4-5/i];
+
+/**
+ * Models the full matrix disqualified, so no heuristic may promote them. Measured on 193 cases at three
+ * repeats, escapes of 579 verdicts, against `claude-haiku-4-5` at 3 on the same cases:
+ *
+ *   gpt-5.6-luna      35
+ *   llama4-scout      30
+ *   claude-sonnet-5   25, plus 18 unparseable verdicts
+ *
+ * `luna` sat in the cheap-name list below until this ran, which made the naming convention promote the
+ * worst reviewer in the field. A measurement decides in both directions or it is not being used.
+ */
+const MEASURED_WORST = [/gpt-5\.6-luna/i, /llama4-scout/i, /claude-sonnet-5/i];
+
+/**
+ * The two families this gate supports reviewing with. A model outside them is not offered, because the
+ * matrix has only ever confirmed a reviewer inside them.
+ *
+ * An account holding neither still gets the unfiltered list rather than an empty picker: offering nothing
+ * would leave the gate unconfigurable, which is worse than offering an unmeasured model and saying so.
+ */
+const SUPPORTED_FAMILY = /claude|anthropic|gpt|openai/i;
 
 /** Roles that already mean "the cheap one" in omp's own vocabulary. */
 const CHEAP_ROLES = ["smol", "tiny"];
 
 /** Naming conventions vendors use for their small models. */
-const CHEAP_NAME = /haiku|mini|flash|lite|luna|small|nano|turbo/i;
+const CHEAP_NAME = /haiku|mini|flash|lite|small|nano|turbo/i;
 
 /**
  * Does a `modelRoles` value refer to this model? Values may be `provider/id`, a bare `id`, or either
@@ -67,6 +105,11 @@ function score(model: WizardModel, options: RankOptions): number {
 	const measured = MEASURED_BEST.findIndex(pattern => pattern.test(model.id) || pattern.test(model.name));
 	if (measured !== -1) return measured;
 
+	// Before the cheap-role promotion, not after: a `smol` role pointing at a disqualified model would
+	// otherwise lift it straight to the top of the picker.
+	if (MEASURED_WORST.some(pattern => pattern.test(model.id) || pattern.test(model.name))) {
+		return MEASURED_BEST.length + 4;
+	}
 	// Below the measured set, the user's own cheap roles still beat a name match: they name a model that
 	// account is known to have credentials for.
 	for (const role of CHEAP_ROLES) {
@@ -90,9 +133,15 @@ function score(model: WizardModel, options: RankOptions): number {
 	return rank;
 }
 
-/** Every model, best candidate first. Ties keep catalog order so the list does not shuffle per call. */
+/**
+ * Supported candidates, best first. Ties keep catalog order so the list does not shuffle per call.
+ *
+ * An account with no Anthropic or OpenAI model keeps the whole catalog instead of an empty picker.
+ */
 export function rankCandidates(models: readonly WizardModel[], options: RankOptions): WizardModel[] {
-	return models
+	const supported = models.filter(model => SUPPORTED_FAMILY.test(model.id) || SUPPORTED_FAMILY.test(model.provider));
+	const offered = supported.length > 0 ? supported : models;
+	return offered
 		.map((model, index) => ({ model, index, score: score(model, options) }))
 		.sort((a, b) => a.score - b.score || a.index - b.index)
 		.map(entry => entry.model);
