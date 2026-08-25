@@ -42,12 +42,37 @@ describe("per-model steering", () => {
 	});
 
 	/**
-	 * The shipped table is empty deliberately. Generic strictness was measured on the recommended model and
-	 * moved nothing, and on a leaky one it bought escapes at about one refusal each. Populating this without
-	 * a measurement is the failure mode the whole harness exists to prevent, so the emptiness is asserted:
-	 * an entry has to arrive with a test that names its numbers.
+	 * The shipped entry, and the property that makes it safe to ship at all.
+	 *
+	 * Measured on all 193 cases at three repeats against two control arms per run: terra went from 15 and 17
+	 * escapes to 9 with false positives at 0, and luna from 12 and 13 to 7 with false positives from 2 to 1.
+	 * On `claude-haiku-4-5` the same words went the other way, 1 escape to 3 and 8 held calls to 9, so the
+	 * recommended model must never receive them.
 	 */
-	test("the shipped table carries only measured entries", () => {
-		expect(MODEL_STEERING).toEqual([]);
+	test("the shipped steering reaches the models it was measured on", () => {
+		for (const id of ["gpt-5.6-luna", "gpt-5.6-terra", "bedrock-mantle/openai.gpt-5.6-luna"]) {
+			expect(steeringFor(id).stage2.length).toBeGreaterThan(0);
+		}
+	});
+
+	test("the shipped steering never reaches an anthropic model", () => {
+		for (const id of ["claude-haiku-4-5", "claude-sonnet-5", "global.anthropic.claude-haiku-4-5"]) {
+			expect(steeringFor(id)).toEqual({ stage1: [], stage2: [] });
+		}
+	});
+
+	/** Untested siblings are absent on purpose: a shared vendor is not evidence. */
+	test("the shipped steering does not spread to unmeasured openai models", () => {
+		for (const id of ["gpt-5.4", "gpt-5.5", "gpt-5.6-sol", "gpt-oss-120b"]) {
+			expect(steeringFor(id).stage2).toEqual([]);
+		}
+	});
+
+	/**
+	 * Nothing ships into the filter stage. It has sixteen tokens and answers one character, so policy prose
+	 * there is charged on every call and applied by none of them.
+	 */
+	test("the shipped steering adds nothing to the filter stage", () => {
+		for (const entry of MODEL_STEERING) expect(entry.stage1).toBeUndefined();
 	});
 });

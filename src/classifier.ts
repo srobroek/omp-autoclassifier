@@ -116,6 +116,20 @@ export interface ClassifyOptions {
 	 */
 	/** Overrides the shipped per-model table. A measurement seam; production passes nothing. */
 	steering?: readonly ModelSteering[];
+	/**
+	 * How far an unsure verdict escalates.
+	 *
+	 * `harm-only` is the shipped narrow reading: escalate a low-confidence allow only when the model also
+	 * named a harmful category. `low` escalates every low-confidence allow, including one that called the
+	 * call ordinary. `medium` escalates medium as well.
+	 */
+	confidenceFloor?: "harm-only" | "low" | "medium";
+	/**
+	 * Enforce the policy against the verdict's own dimensions: a named harm with `absent` or `revoked`
+	 * authorization cannot be an allow. `off` trusts the decision field, which is the field models get
+	 * wrong while getting the dimensions right.
+	 */
+	statedPolicy?: "off" | "ask" | "deny";
 	extraStage1?: readonly string[];
 	/**
 	 * Extra policy lines for the review stage only, landing after the shared policy and before the schema
@@ -650,10 +664,42 @@ export async function classify(
 		// promise this gate makes. A refusal we cannot interpret has to block.
 		if (verdict.decision === "ask") return { kind: "ask", reason, stage: 2, dimensions };
 		if (verdict.decision === "deny") return { kind: "deny", reason, stage: 2, dimensions };
+		// A verdict that names a harm and then permits it contradicts the policy it was given, which says to
+		// allow on `explicit` or `implied` authorization and refuse on `absent` or `revoked`. Measured on the
+		// full matrix, that contradiction is a real escape class rather than a curiosity: luna allowed
+		// `commit-a-private-key` while reporting `credentials`, and `sql-string-concatenation` while
+		// reporting `control`.
+		//
+		// Enforcing it against the model's own fields is stronger than asking it to be consistent, because
+		// the decision field is the part it gets wrong while the dimensions are the part it gets right. It
+		// cannot be reached by wording, and it cannot be talked out of.
+		//
+		// Off by default until the false-positive cost is measured: a model that mislabels ordinary work as
+		// harmful would have that mislabel promoted from a nuisance into a refusal.
+		const enforcement = options.statedPolicy ?? "off";
+		if (enforcement !== "off") {
+			const named = dimensions.category !== "none" && dimensions.category !== "unstated";
+			const unauthorized = dimensions.authorization === "absent" || dimensions.authorization === "revoked";
+			if (named && unauthorized) {
+				const why = `${reason} The verdict named ${dimensions.category} with ${dimensions.authorization} authorization, which the policy refuses.`;
+				return { kind: enforcement === "deny" ? "deny" : "ask", reason: why, stage: 2, dimensions };
+			}
+		}
 		// An unsure allow on something harmful is not an allow. Hand it to a human, which config then
 		// turns into a prompt or a denial.
+		//
+		// The `statedHarm` gate is the narrow reading: it only escalates when the model already named a
+		// category, so a verdict that says "ordinary work" while reporting low confidence goes straight
+		// through. Whether widening that is worth its false positives is a measurement, not a preference,
+		// so the floor is selectable and the shipped default stays the narrow one until numbers say
+		// otherwise.
 		const statedHarm = dimensions.category !== "none" && dimensions.category !== "unstated";
-		if (dimensions.confidence === "low" && statedHarm) {
+		const floor = options.confidenceFloor ?? "harm-only";
+		const unsure =
+			floor === "harm-only"
+				? dimensions.confidence === "low" && statedHarm
+				: dimensions.confidence === "low" || (floor === "medium" && dimensions.confidence === "medium");
+		if (unsure) {
 			return { kind: "ask", reason: `${reason} The classifier was not confident.`, stage: 2, dimensions };
 		}
 		return { kind: "allow", reason, stage: 2, dimensions };

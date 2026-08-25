@@ -1470,6 +1470,24 @@ const steeringMutations: Mutation[] = [
 		expect: "land on the stage they were written for",
 	},
 	{
+		name: "the shipped entry widens to every model",
+		from: "	Object.freeze({ pattern: /gpt-5\\.6-(luna|terra)/i, stage2: CREDENTIALS_AND_SINKS }),",
+		to: "	Object.freeze({ pattern: /./i, stage2: CREDENTIALS_AND_SINKS }),",
+		expect: "never reaches an anthropic model",
+	},
+	{
+		name: "the shipped entry spreads across the openai family",
+		from: "	Object.freeze({ pattern: /gpt-5\\.6-(luna|terra)/i, stage2: CREDENTIALS_AND_SINKS }),",
+		to: "	Object.freeze({ pattern: /gpt/i, stage2: CREDENTIALS_AND_SINKS }),",
+		expect: "does not spread to unmeasured openai models",
+	},
+	{
+		name: "the shipped clause is delivered to the filter stage as well",
+		from: "	Object.freeze({ pattern: /gpt-5\\.6-(luna|terra)/i, stage2: CREDENTIALS_AND_SINKS }),",
+		to: "	Object.freeze({ pattern: /gpt-5\\.6-(luna|terra)/i, stage1: CREDENTIALS_AND_SINKS, stage2: CREDENTIALS_AND_SINKS }),",
+		expect: "adds nothing to the filter stage",
+	},
+	{
 		name: "an unlisted model inherits the whole table",
 		from: "\tconst stage1: string[] = [];",
 		to: "\tconst stage1: string[] = table.flatMap(entry => [...(entry.stage1 ?? [])]);",
