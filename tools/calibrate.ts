@@ -2116,6 +2116,12 @@ export async function runCalibration(
 	selected: Case[] = cases,
 	concurrency = 6,
 	repeats = 3,
+	/**
+	 * The `environment` prose, overridable because it is the only conservatism lever a user actually has:
+	 * it reaches both stage prompts through `evidence.systemPrompt`. Tuning through it measures the shipped
+	 * path rather than a replica of it.
+	 */
+	environment: readonly string[] = DEFAULT_ENVIRONMENT,
 ): Promise<CaseResult[]> {
 	const cwd = "/work/project";
 	const rules = compileRules(

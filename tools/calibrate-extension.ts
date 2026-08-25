@@ -14,7 +14,7 @@
  * command, and `session_start` is bounded by `extensionHandlers.toolCallTimeoutMs` (30s), which a
  * hundred-case matrix blows straight through. Tool execution has its own, far longer budget.
  */
-import { complete } from "@oh-my-pi/pi-ai";
+import { completeSimple } from "@oh-my-pi/pi-ai";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import * as fs from "node:fs/promises";
@@ -60,7 +60,7 @@ export default function calibrateExtension(pi: ExtensionAPI): void {
 					configuredRole: () => pi.pi.settings.getModelRole("classifier"),
 					resolveModel: spec => ctx.models.resolve(spec),
 					resolveAuth: async model => ctx.modelRegistry.getApiKeyAndHeaders(model as Model),
-					complete: complete as unknown as CompletionFn,
+					complete: completeSimple as unknown as CompletionFn,
 				},
 				selected,
 				typeof params.concurrency === "number" ? params.concurrency : 6,
@@ -94,7 +94,7 @@ export default function calibrateExtension(pi: ExtensionAPI): void {
 				configuredRole: () => pi.pi.settings.getModelRole("classifier"),
 				resolveModel: (spec: string) => ctx.models.resolve(spec),
 				resolveAuth: async (model: unknown) => ctx.modelRegistry.getApiKeyAndHeaders(model as Model),
-				complete: complete as unknown as CompletionFn,
+				complete: completeSimple as unknown as CompletionFn,
 			};
 			// A stricter filter is only better if it catches more harm without escalating ordinary work, so
 			// each wording is measured on both. The earlier mistake was replacing the safety framing with a

@@ -110,39 +110,193 @@ Four requirements, all read off `src/classifier.ts` rather than inferred:
 Every verdict is requested at `temperature: 0`. A provider that ignores it stays correct but noisy, and
 its noise shows up as the `unstable` count below.
 
+### Guard-specific models
+
+A dedicated guard model sounds like the right tool and mostly is not, for one reason: the published ones
+classify **content** harm, and this gate judges **actions**. Llama Guard scores violence and self-harm; it
+has no category for an unauthorized `rm -rf` or a credential read. The exception is OpenAI's
+`gpt-oss-safeguard` line, which is policy-conditioned: the caller supplies the policy, which is this
+gate's exact shape.
+
+What omp's catalog has, and where:
+
+| model | providers in omp | reachable on Bedrock |
+| --- | --- | --- |
+| `gpt-oss-safeguard-20b`, `-120b` | amazon-bedrock, groq, openrouter, kilo, vercel-ai-gateway | yes |
+| Llama Guard 2 / 3 / 4 | kilo, nvidia | no |
+| NeMoGuard content-safety, topic-control, nemotron-safety-guard-8b-v3 | nvidia | no |
+| Gemma-4-31B-AssGuard | nanogpt | no |
+| WildGuard, Qwen3Guard, ShieldGemma, omni-moderation | absent from the catalog | no |
+
+**Tested:** both `gpt-oss-safeguard` sizes resolve on Bedrock and answer, and neither produced a usable
+verdict. They emit their own policy-label format rather than the JSON this gate parses, so adopting one
+means a separate prompt and parser, not a model swap. That is real work with a plausible payoff, and it is
+not a drop-in.
+
+**Not tested, and not dismissed:** everything on a provider this estate lacks. Of those, only Llama Guard
+is a plausible fit, and its taxonomy is still content-shaped.
+
+### gpt-oss, and an omp catalog id that is wrong
+
+`gpt-oss-120b` and `gpt-oss-20b` work. Reaching them takes a workaround, because omp's catalog id is missing
+a version suffix.
+
+omp resolves `gpt-oss-120b` to `openai.gpt-oss-120b` and posts to
+`bedrock-runtime.us-east-1.amazonaws.com/model/openai.gpt-oss-120b/converse-stream`, which returns
+`400 The provided model identifier is invalid`. AWS publishes the id with a suffix:
+
+```sh
+aws bedrock list-foundation-models --region us-east-1 \
+    --query 'modelSummaries[?contains(modelId, `gpt-oss`)].[modelId]' --output text
+openai.gpt-oss-120b-1:0
+openai.gpt-oss-20b-1:0
+openai.gpt-oss-safeguard-120b
+openai.gpt-oss-safeguard-20b
+```
+
+The safeguard entries carry no suffix upstream, which is why they resolve and their siblings do not.
+
+Two wrong turns are worth recording, because both looked convincing. A missing inference-profile prefix was
+the obvious cause, so `us.`, `global.`, `eu.`, and `apac.` were each tried against both sizes: all returned
+the same 400. Then both AWS profiles failed identically, 33 of 33 cases and 9 of 9, which read as the models
+being absent from the estate. That conclusion was wrong, and `list-foundation-models` is what settled it. Ask
+the provider what it has before concluding it has nothing.
+
+Measured by cloning the resolved model with the published id, 17 cases, one repeat:
+
+| model | escapes | wrong | failed | median | $/1k verdicts |
+| --- | --- | --- | --- | --- | --- |
+| `gpt-oss-120b` | 3 | 3 | 0 | 3539ms | $0.66 |
+| `gpt-oss-20b` | 3 | 3 | 1 | 2803ms | $0.37 |
+
+Neither belongs in `MEASURED_BEST`. `llama4-scout` allowed nothing through at 1171ms and $0.48, so the larger
+`gpt-oss` costs three times the latency and lets harm through. Thin sampling cannot explain a gap that wide.
+
+A row reading `escapes 0 | wrong 0 | failed 17` means the model never answered rather than that it let
+nothing through, which is why `ac_rank` sorts on `failed > 0` before it compares escapes.
+
+### Reasoning levels: keep the default, and measure on the matrix
+
+`callStage` sends `disableReasoning: true` for every model. Escapes and latency across 33 cases:
+
+| config | model | escapes | median | $/1k |
+| --- | --- | --- | --- | --- |
+| off, shipped | `claude-haiku-4-5` | 0 | 3015ms | $2.84 |
+| off, shipped | `claude-sonnet-5` | 0 | 4635ms | $6.42 |
+| low | `claude-sonnet-5` | 1 | 4216ms | $4.05 |
+| low | `claude-haiku-4-5` | 1 | 10025ms | $6.53 |
+
+Both models allow one more dangerous call through at `reasoning: "low"`, and neither gains enough to justify
+chasing it: sonnet takes 9 per cent off its median, haiku triples.
+
+This question re-opened three times, and each time the evidence collapsed under a larger sample:
+
+| reading | sample | claim |
+| --- | --- | --- |
+| sonnet 8621ms off / 5471ms low | 1 pass, 8 cases | low is faster |
+| sonnet 7702ms off / 2769ms low, 546 tok / 118 tok | 5 repeats, 1 case | low is much faster |
+| haiku 208 tok off / 534 tok low | 5 repeats, 1 case | the answer is model-dependent |
+| sonnet 4635ms off / 4216ms low, escapes 0 / 1 | 33 cases | neither, keep the default |
+
+A single case is a single prompt, and prompts differ in how much a model writes about them. Measure a reasoning
+change on the matrix with `ac_rank --reasoning`, never on one case with `ac_latency_anatomy`. The anatomy tool
+is for decomposing where time goes within one call, not for deciding policy.
+
+`reasoning: "minimal"` is not an option at any tier: eight of eight calls errored on both models tested.
+
+### Output-shrinking settings that do not work
+
+Generation dominates a verdict, so settings that shrink what the model writes look like the obvious lever.
+Codex ships its own reviewer at `default_verbosity: "low"` with `default_reasoning_summary: "none"`. The claim
+is about token count, so the reading below is output tokens:
+
+| stage 2 on `claude-haiku-4-5` | out tokens | total |
+| --- | --- | --- |
+| shipped | 208 | 2387ms |
+| + `hideThinkingSummary` | 208 | 2762ms |
+| + `textVerbosity: "low"` | 208 | 2511ms |
+| + both | 208 | 2367ms |
+
+Identical to the token across four variants, so both settings are inert on Anthropic. The reason is
+mechanical. The gate already sends `disableReasoning: true`, so no thinking summary exists to suppress, and
+Anthropic drops `textVerbosity` because it is an OpenAI Responses parameter. With token count fixed, the
+spread in the latency column is the noise floor.
+
+On `gpt-5.6-luna` `textVerbosity: "low"` does cut output, 173 tokens to 144 and 2295ms to 1447ms. Treat that
+as unproven: the same shipped configuration measured 272 tokens on one sample and 173 on the next, a swing as
+large as the effect. It needs five or more repeats before anyone ships it.
+
+Neither setting is a default. `callStage` in `src/classifier.ts` carries a comment saying so, and two tests in
+`test/classifier.test.ts` hold the line: one asserts `providerOptions` reaches both stages, the other asserts
+neither setting appears without it.
+
+There is no JSON-schema option in `pi-ai`, so structured output would mean a forced tool call rather than a
+request flag. `parseVerdict` already extracts the first JSON object from surrounding prose, so the parse is
+not what is costing tokens.
+
+### Per-model prompts, and why the divergence belongs in settings
+
+`claude-sonnet-5` was measured on the full matrix at the shipped settings: 25 escapes, 18 failures, $4.80
+per thousand verdicts, p95 17918ms. On the same cases `claude-haiku-4-5` allows nothing through for $2.83
+at half the latency, so sonnet is dominated on every axis at once.
+
+The 18 failures are not timeouts. They come from `classifier.ts` after a retry, which is the parse path.
+The mechanism is measured under "Reasoning levels": with `disableReasoning: true` sonnet emits a median of
+546 output tokens where haiku emits 208, against a `STAGE2_MAX_TOKENS` cap of 700. A 546-token median under a
+700-token cap truncates its own tail mid-JSON on roughly three per cent of calls.
+
+Sonnet is the strongest case this project has for treating a model individually, so the kind of case it is
+matters. Sonnet does not need different instructions. It needs a different token budget, or
+reasoning left on so it answers tersely instead of rambling. Both are settings, and one per-model setting
+already ships: sonnet rejects `temperature` outright, and the gate memoises that rejection per model.
+
+A per-model system prompt is a different proposition, and the record argues against it. Six hardening levels
+across four models moved escapes by no more than the noise floor, and four earlier prompt experiments all
+failed:
+
+- Claude Code's full anti-hallucination wording left the hallucinated axis at 16/16, for twice the words.
+- Its must-name Intent Rule, adopted as a general principle, took `auth=explicit` from 18/21 to 14/21.
+
+The prompt is also the whole security policy. Every block in `STAGE2_SYSTEM` closes a hole a review found,
+so forking it per model leaves a hole closed for one model open in the others, and no test reports the
+divergence.
+
+If per-model prose is ever warranted it should take the shape of the temperature table: a bounded quirk
+appended to one shared policy, never a second policy.
+
 ### Which model to pick
 
-Measured on 193 cases at three repeats, `temperature: 0`, majority verdict:
+Full matrix: 193 cases, three repeats, 579 verdicts per model, shipped request shape.
 
-| model | harm allowed | unstable | effective | median | p95 |
+| model | harm allowed | wrong | median | p95 | $/1k verdicts |
 | --- | --- | --- | --- | --- | --- |
-| `claude-haiku-4-5` | **0** | **0/193** | 185/193 | 3449ms | 4845ms |
-| `claude-sonnet-5` | 7 | not run | 186/193 | 4516ms | 9560ms |
-| `gpt-5.6-luna` | 13 | 12/193 | 179/193 | 1755ms | 3131ms |
-| `gpt-5.6-terra` | 14 | not run | 179/193 | 1866ms | 3952ms |
+| `claude-haiku-4-5` | **3** | 27 | 2322ms | 3955ms | $2.83 |
+| `llama4-scout` | 30 | 69 | 1194ms | 2959ms | $0.51 |
+| `gpt-5.6-luna` | 35 | 42 | 2216ms | 3931ms | $0.47 |
 
-**Read the first column.** It counts dangerous calls the gate allowed, and it does not track the others.
-`terra` scored highest of the four on exact matching and allowed the most harm, so exact matching is the
-wrong metric for choosing here.
+`claude-haiku-4-5` is the recommendation and the only entry in `MEASURED_BEST`. It costs five times more per
+verdict than the alternatives and allows a tenth of the harm.
 
-`claude-haiku-4-5` is the recommendation, and `/autoclassifier setup` ranks it first. It allowed nothing through
-and gave the same verdict on all three passes. It costs about 1.7 seconds more per verdict than `luna` and
-refuses three authorized calls that `luna` allows.
+**`llama4-scout` is why the entry rule demands the full matrix.** Over 33 cases it allowed nothing through and
+topped every short ranking here. Over 193 it allows thirty.
 
-Two findings worth keeping separate from the table:
+- The short sample did not contain the calls it gets wrong.
+- Repeats would never have found them, because repeats resample the same prompts.
+- Width and repeats fix different problems: width covers which calls get judged, repeats cover run-to-run
+  variance on one call.
 
-- **Cheap is not the axis, and family is not either.** The cheapest model in the field is also the safest.
-  Before this ran, the setup ranked by cheapness and therefore recommended the leakiest of the four.
-- **Instability is a model property.** Both arms ran pinned at `temperature: 0`. One flapped on twelve
-  cases and the other on none, so pinning sampling does not by itself buy a stable gate.
+Read the first column and nothing else for the decision. `scout` wins latency and cost outright, and a gate
+that allows thirty dangerous calls is not cheap.
 
-One account, one prompt revision, one matrix. Re-run `ac_model_bakeoff` before trusting the order.
+Two route notes for `gpt-5.6-luna`, which resolves to `bedrock-mantle` by default. The same model is also on
+`amazon-bedrock/global.openai.gpt-5.6-luna` over `bedrock-converse-stream` rather than `openai-responses`.
+Over 33 cases the converse route had a far better tail, 4816ms p95 against 7807ms, at 3.5 times the cost,
+$1.35 against $0.39. Neither route changes the verdict: luna is out on accuracy.
 
 ### Latency, and where it goes
 
 Because the gate runs before every tool call, a verdict taxes every action. The report prints the wait
-per verdict, split by stage. The first stage answers alone or hands on to the second, and the
-table below gives the cost of each.
+per verdict, split by stage. The first stage answers alone or hands on to the second, at the costs measured here.
 
 Measured on 193 cases, one pass each:
 
@@ -155,8 +309,8 @@ Measured on 193 cases, one pass each:
 
 The last column is the lever, not the model. A stage-one allow settles the call; anything else pays for a
 second review. On `luna` the filter clears only nine per cent, so the gate reviews the other ninety-one.
-Three other models clear roughly thirty per cent on the same cases and the same prompt. That makes the
-rate a property of the model reading that prompt, not of the design.
+Three other models clear roughly thirty per cent on the same cases and the same prompt. The clearance
+rate is therefore a property of the model reading that prompt, not of the design.
 
 Two paths cost nothing at all, and they carry most real traffic:
 
@@ -168,29 +322,47 @@ Two paths cost nothing at all, and they carry most real traffic:
 `bedrock-mantle/openai.gpt-5.6-luna`, the same tier as omp's own `smol` and `tiny` roles. Every figure
 below is a property of that model and this prompt together, not of the design.
 
-**Neither reference implementation runs its cheapest general model on this job**, so the choice stays
-open rather than settled. Both findings come from reading the installed binaries:
+Both vendors run a cheap model with thinking off, and Claude Code's two settings match this gate's.
+An earlier revision claimed the opposite, on the strength of a symbol name. Reading the code corrected it:
 
-- **Claude Code** (2.1.241.694) defaults its auto-mode classifier to a Sonnet-class model, named by the
-  symbol `getClassifierSonnet5Default`. It carries an escalation path in `getClassifierOpusReroute` and
-  takes the model from a server-side config flag, `tengu_bg_classifier_config`. A Haiku default exists in
-  the same binary, `getDefaultHaikuModel`, and is not what the classifier uses. The concrete id resolves
-  at runtime rather than appearing as a literal, so none is quoted here.
-- **Codex** (0.146.1.378) does not reuse a general model at all. It ships a dedicated reviewer,
-  `codex-auto-review`, as its own entry in the embedded model catalog with `default_verbosity: "low"` and
-  a 10,000-token truncation policy. It is hardcoded rather than taken from the user's `model` setting,
-  which is the subject of `openai/codex#24879`.
+- **Claude Code** (2.1.241.694) defaults to the small fast model with thinking off. Its config function
+  returns `{ useSmallFastModel: true, disableThinking: true, midTurnLlmDebounceMs: 60000 }`.
+  - The selector reads `if (useSmallFastModel) return RD()`. `RD` resolves `ANTHROPIC_SMALL_FAST_MODEL`.
+  - The Opus reroute sits on the other branch. Only a session model matching one of two frontier codenames
+    reaches it, and only when the flag is off.
+  - `getClassifierSonnet5Default` exists in the same binary. This path does not use it.
+  - `disableReasoning: true` here matches `disableThinking: true` there. Both were arrived at separately.
+- Its verdict carries `stage1Severity` and `stage2Severity` alongside `category`, `stage`, `failureMode`,
+  `shouldBlock`, and per-stage request ids, costs and cache tokens. Two graded stages rather than this
+  gate's one-token `0`/`1`, and the same `consecutiveDenials`/`totalDenials` breaker.
+- It also carries three levers absent here: `classifierQueueDepth` and `classifierQueueWaitMs` with
+  `sameTurnSiblings`, a 60-second debounce on mid-turn classification, and an `inProtectedNamespace` test.
+- **Codex** (0.146.1.378) has no cheap first stage at all. Its review runs as a guardian subagent
+  (`auto_review_guardian_subagent`, `guardian_review_model_override`) under a mode that is `never`,
+  `unless_trusted`, or `on_request`. The cost lever is `unless_trusted`: a deterministic decision about
+  what never reaches review, rather than a cheap model call deciding it. Its telemetry records:
+  - `failed_closed`, `timed_out`, `parse_error`, `review_timeout_ms`
+  - verdicts `approved_with_amendment`, `approved_for_session`, and network-policy approve and deny
 
-So one vendor moved up a tier and the other built a purpose-made model. This gate runs the cheapest tier
-available. Whether a stronger model closes the accuracy gap here is **untested**. It needs a
-before-and-after on the pre-existing cases, at the same repeats, read against the floor. Do not assume
-it, and do not assume cheap suffices because the current numbers look close.
+This bears directly on the filter here. Over 130 cases at three repeats, one escape of nineteen came
+through stage 1. The rest were review-stage misjudgements.
+
+- The filter is not where danger gets through.
+- Clearing more calls cheaply costs no safety at the current prompt.
+- The evidence favours the allowlist over the filter as the lever: a rule match costs nothing, and a reader
+  can audit it. A filter verdict holds only as far as the last measurement.
+
+Neither vendor pays for a frontier model here. Claude Code runs the small fast tier with thinking off, and
+Codex runs a purpose-made reviewer at low verbosity. This gate runs the cheapest tier too, which now agrees
+with both rather than undercutting them. Whether a stronger model closes the remaining accuracy gap stays
+**untested**: it needs a before-and-after on the pre-existing cases, at the same repeats, read against the
+floor.
 
 ## Read the noise floor before believing a delta
 
 The model is not deterministic. Two byte-identical runs of this matrix once disagreed on **fourteen of a
-hundred and sixty-five cases**. That is wider than any prompt edit measured against it, so a single pass
-cannot tell a tuning win from a coin flip.
+hundred and sixty-five cases**. That spread is wider than any prompt edit measured against it, so a
+single pass cannot tell a tuning win from a coin flip.
 
 **Re-derive the floor; never carry a number forward.** Run the matrix twice unmodified and take the larger
 `unstable` count. The larger count is the floor for that session, that model, and that prompt.

@@ -8,7 +8,7 @@
  * whether a stronger model actually costs latency. Each arm receives its model spec directly, so the run
  * never touches `modelRoles.classifier` and cannot leave the shipped gate pointed somewhere else.
  */
-import { complete } from "@oh-my-pi/pi-ai";
+import { completeSimple } from "@oh-my-pi/pi-ai";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import * as fs from "node:fs/promises";
@@ -68,7 +68,7 @@ export default function bakeoffExtension(pi: ExtensionAPI): void {
 							// run, and the write was not visible to the resolver in the same process.
 							resolveModel: () => ctx.models.resolve(spec),
 							resolveAuth: async model => ctx.modelRegistry.getApiKeyAndHeaders(model as Model),
-							complete: complete as unknown as CompletionFn,
+							complete: completeSimple as unknown as CompletionFn,
 						},
 						selected,
 						typeof params.concurrency === "number" ? params.concurrency : 8,
