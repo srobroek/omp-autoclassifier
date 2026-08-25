@@ -13,8 +13,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULTS_SENTINEL, type PathVars, type RuleLists, type RuleVerdict } from "./defaults";
 
-/** Tools whose primary argument is a filesystem path, and therefore compared path-wise. */
-const PATH_TOOLS = new Set(["read", "write", "edit"]);
+/**
+ * Tools whose target is a filesystem path, and therefore compared path-wise.
+ *
+ * `grep` and `glob` belong here even though their primary argument is not a path. A review found the
+ * reason: `grep` is allowlisted and returns the matching lines, so searching `~/.ssh` for `PRIVATE KEY`
+ * leaks the key as surely as reading the file, and a path rule could not see the target because the tool
+ * was not compared path-wise. Their `path` field is optional, and a call without one resolves to no
+ * targets, which a path rule then declines to claim. So a bare search still takes the fast path.
+ */
+const PATH_TOOLS = new Set(["read", "write", "edit", "grep", "glob"]);
 
 /** Tools whose primary argument is a named field rather than the serialized input. */
 const PRIMARY_FIELD: Record<string, string> = {
@@ -28,6 +36,44 @@ const PRIMARY_FIELD: Record<string, string> = {
 	lsp: "action",
 	web_search: "query",
 };
+
+/**
+ * Tools whose argument is a command line rather than a value, so one call can carry several actions.
+ *
+ * These need the same allow/deny asymmetry paths get, for the same reason. `bash` matches on its whole
+ * `command` string, so `allow: ["bash(git status*)"]` cleared `git status` followed by anything at all,
+ * and `deny: ["bash(git push*)"]` missed a push that had a harmless command in front of it. Both holes
+ * open with a rule a careful user would plausibly write.
+ */
+const COMMAND_TOOLS: Record<string, true> = { bash: true, eval: true };
+
+/** Shell text that starts a new action, plus the two substitution forms that smuggle one inside another. */
+const LINK_SPLIT_RE = /&&|\|\||[;\n|]/;
+const SUBSTITUTION_RE = /\$\(([^()]*)\)|`([^`]*)`/g;
+/**
+ * The same shapes without `g`. A global regex carries `lastIndex` across `.test()` calls, so reusing
+ * `SUBSTITUTION_RE` for a predicate returns alternating answers on identical input.
+ */
+const OPERATOR_PRESENT_RE = /&&|\|\||[;\n|]|\$\(|`/;
+
+/**
+ * Every action a command string carries: the top-level links, plus the body of any substitution.
+ *
+ * Quoting is deliberately not parsed. Splitting inside a quoted string makes an allow stricter and a deny
+ * broader, and both of those are the safe direction, so a shell-accurate parser would only ever weaken
+ * this. A single link comes back as a one-element list, which leaves an ordinary command on the existing
+ * whole-string path.
+ */
+export function commandLinks(value: string): string[] {
+	const inner: string[] = [];
+	const stripped = value.replace(SUBSTITUTION_RE, (_match, dollar: string | undefined, tick: string | undefined) => {
+		const body = (dollar ?? tick ?? "").trim();
+		if (body.length > 0) inner.push(body);
+		return " ";
+	});
+	const links = [...stripped.split(LINK_SPLIT_RE), ...inner].map(link => link.trim()).filter(link => link.length > 0);
+	return links.length > 0 ? links : [value.trim()];
+}
 
 /**
  * The value a rule pattern is matched against. Unknown tools, including every `mcp__*` server tool,
@@ -182,6 +228,8 @@ interface Matcher {
 	pathwise: boolean;
 	/** Whether the rule itself names a URL scheme, and so knowingly covers remote targets. */
 	schemeAware: boolean;
+	/** Whether the rule itself contains a shell operator, and so knowingly covers a compound command. */
+	operatorAware: boolean;
 	source: string;
 }
 
@@ -210,7 +258,7 @@ function compileOne(rule: string, vars: PathVars): Matcher | undefined {
 
 	const open = trimmed.indexOf("(");
 	if (open === -1) {
-		return { tool: globToRegExp(trimmed), pathwise: false, schemeAware: false, source: trimmed };
+		return { tool: globToRegExp(trimmed), pathwise: false, schemeAware: false, operatorAware: false, source: trimmed };
 	}
 	if (!trimmed.endsWith(")")) return undefined;
 
@@ -221,7 +269,14 @@ function compileOne(rule: string, vars: PathVars): Matcher | undefined {
 	const pathwise = PATH_TOOLS.has(toolName);
 	const expanded = expandVars(argPattern, vars);
 	const arg = pathwise ? globToRegExp(resolveRealish(expanded, vars.cwd, vars.home)) : globToRegExp(expanded);
-	return { tool: globToRegExp(toolName), arg, pathwise, schemeAware: expanded.includes("://"), source: trimmed };
+	return {
+		tool: globToRegExp(toolName),
+		arg,
+		pathwise,
+		schemeAware: expanded.includes("://"),
+		operatorAware: OPERATOR_PRESENT_RE.test(expanded),
+		source: trimmed,
+	};
 }
 
 export function compileRules(lists: RuleLists, vars: PathVars): CompiledRules {
@@ -268,6 +323,19 @@ function matcherClaims(
 		// Report the specific path that tripped the rule, not the whole list.
 		const hit = resolved.find(target => arg.test(target));
 		return hit === undefined ? undefined : { target: describeTarget(hit) };
+	}
+	// The same any/every doctrine, for the tools whose one argument carries several actions. A rule that
+	// writes an operator itself is taken at its word and compared whole, exactly as a scheme-aware rule is.
+	if (COMMAND_TOOLS[toolName] === true && !matcher.operatorAware) {
+		const links = commandLinks(rawArgument);
+		if (links.length > 1) {
+			if (list === "allow") {
+				return links.every(link => arg.test(link)) ? { target: describeTarget(links[0]) } : undefined;
+			}
+			// Name the link that tripped the rule, not the whole pipeline.
+			const hit = links.find(link => arg.test(link));
+			return hit === undefined ? undefined : { target: describeTarget(hit) };
+		}
 	}
 	return arg.test(rawArgument) ? { target: describeTarget(rawArgument) } : undefined;
 }

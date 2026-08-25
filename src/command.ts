@@ -70,8 +70,13 @@ function status(deps: CommandDeps): string {
 	} else if (role === undefined) {
 		lines.push("autoclassifier: **inactive** — no `classifier` model role is configured.");
 		lines.push("Run `/autoclassifier setup` to choose a model; until then no tool call is classified.");
+	} else if (deps.state.locked) {
+		// Ordered above `paused` to match the gate, which checks the lock first: the two states have opposite
+		// effects, so reporting the wrong one tells the user their session is permissive when it is stopped.
+		lines.push(`autoclassifier: **locked** — ${cfg.maxConsecutiveDenials} refusals in a row.`);
+		lines.push("Every call is refused, including reads, until you run `/autoclassifier resume`.");
 	} else if (deps.state.paused) {
-		lines.push("autoclassifier: **paused** — the breaker tripped after repeated blocks.");
+		lines.push("autoclassifier: **paused** — the classifier failed repeatedly, so the breaker tripped.");
 		lines.push("Every call is allowed until you run `/autoclassifier resume`.");
 	} else if (snapshot.degradedReason !== undefined) {
 		lines.push(`autoclassifier: **degraded** — blocking every classified call: ${snapshot.degradedReason}`);

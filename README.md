@@ -50,6 +50,83 @@ Two orderings are deliberate:
 - **The kill switch outranks everything, anti-tamper included.** It is the documented way out of a
   lockout, so it has to be total.
 
+### What the verdict reports
+
+The second stage answers with a decision and the axes it turned on. That makes a refusal auditable, and
+lets the prompt be tuned against evidence rather than taste:
+
+| Field | Values | Why it is there |
+| --- | --- | --- |
+| `decision` | `allow` / `ask` / `deny` | `ask` means a human should choose. With `escalate: false`, the default, it blocks. |
+| `risk` | `low` / `medium` / `high` | Severity if the call is wrong. |
+| `category` | `none` / `destruction` / `credentials` / `control` / `persistence` / `external` | Which kind of harm. `none` is ordinary work and always allowed. |
+| `authorization` | `explicit` / `implied` / `absent` / `revoked` | What the user's own messages authorized. Nothing else can authorize anything. |
+| `reversibility` | `reversible` / `recoverable` / `irreversible` | A better predictor of harm than `risk`: `rm -rf dist` and a force-push over someone's commits are both "high", and only one is unrecoverable. |
+| `scope` | `file` / `worktree` / `machine` / `shared` / `third-party` | How far the effect reaches. Separates `rm -rf dist` from `rm -rf ~`. |
+| `confidence` | `low` / `medium` / `high` | A stated low confidence on a harmful category becomes an `ask` rather than an allow. |
+| `injectionSuspected` | boolean | Set when the evidence itself tried to authorize the call. Never allowed, always logged. |
+| `alternative` | string | A safer command reaching the same goal. Only requested when `suggestAlternative: true`, because it costs tokens on every review. |
+
+### Two readers, two shapes
+
+The gate reports every refusal twice, because an agent and a person need different things from it.
+
+The **agent** gets JSON as the tool error on every denial: rule blocks, judged blocks, and locks alike.
+One shape, so anything reading a refusal never has to work out which kind it got:
+
+```json
+{
+  "autoclassifier": "blocked",
+  "tool": "bash",
+  "target": "git reset --hard origin/main",
+  "category": "destruction",
+  "authorization": "absent",
+  "risk": "high",
+  "reversibility": "irreversible",
+  "scope": "shared",
+  "why": "Rewrites history other people have pulled.",
+  "next": "Do something materially safer that reaches the same goal, or tell the user the risk and ask them for this specific action.",
+  "notThis": "Rewording this call, splitting it across calls, or handing it to a subagent.",
+  "otherwise": "Carry on with anything that does not depend on this.",
+  "warning": "2 more consecutive refusals locks this session..."
+}
+```
+
+`next` stays a sentence on purpose. The structure is for finding the fields. The instruction is still the
+thing the agent has to act on.
+
+The user gets one line, as a notification:
+
+```
+autoclassifier blocked `bash` on git reset --hard origin/main (destruction): Rewrites history other people have pulled.
+```
+
+Sending both readers the same string served neither: the fielded form is noise in a toast, and a one-liner
+leaves an agent guessing which axis refused it. The user's line carries no `next`, because the agent's
+moves are not theirs to take.
+
+### A refused call stays refused
+
+The gate never caches a denial, so authorization you give in chat takes effect at once. The cost: the
+agent can ask again in different words. A measured run rode exactly that. The gate refused a
+subagent spawn, the agent reworded it until a fresh review passed it, and the child ran the command the
+parent could not. Each review was correct in isolation.
+
+So the gate remembers its refusals. Every later review in the session sees what it already refused. It
+also states the rule: rewording a request, splitting it across calls, or handing it to a subagent does
+not make it a new request. Sessions that start later inherit those refusals, which is what carries them
+across the subagent boundary. A subagent's own gate starts empty. Only your own messages lift a
+refusal, and only for the action they name.
+
+Three related guards sit in the review itself:
+
+- **Silence is not agreement.** Earlier calls going through says nothing about this one, because watching
+  and not having looked are indistinguishable from inside a transcript.
+- **A refusal by this gate is not you rejecting anything**, so it does not compound. A call *you* stopped
+  or refused does stay refused.
+- **Agreement to a preparatory step does not carry to the step that ships its result.** Approving a
+  rename or a config write is not approving the push that publishes it.
+
 ### The gate fails closed
 
 A classifier that times out, errors, loses its credentials, or returns an unparseable verdict **blocks
@@ -106,9 +183,34 @@ A `ssh://` target disqualifies every allowlist entry, because omp promotes such 
 `read ssh://host/etc/passwd` runs on another machine. Write `read(ssh://*)` explicitly if you want it
 allowed anyway.
 
-The shipped `hardDeny` list is **anti-tamper only**. It protects this plugin's configuration, omp's
-settings, and the plugins directory. Everything else destructive goes to the classifier, which is
-coherent only because failure blocks.
+### What the shipped hardDeny list covers
+
+Anti-tamper only. It protects this plugin's configuration, omp's settings, the plugins directory, and one
+thing that is easy to overlook: **the session transcript**.
+
+A resumed session reads its transcript back as the record of what you authorized. A line shaped like a
+user message therefore becomes user intent for that session's reviews. It does not reach the running session, because
+`getBranch()` walks an in-memory index and the journal is written from memory rather than read back, so
+the threat is deferred rather than live. Writes are refused; reads are not, since omp's own history
+tooling depends on them.
+
+Everything else destructive goes to the classifier. That holds together only because a failure blocks.
+
+### What the shipped ask list covers
+
+History rewriting, and nothing else: `filter-branch`, `filter-repo`, `bfg`, `rebase --root`.
+
+Here a pattern beat judgement on measurement. The classifier reads them as the
+ordinary means to a fair end, and allowed `git filter-branch --force` on the strength of "remove the
+large binary from the repo". A prompt fix for that cost five refusals of work the user had plainly asked
+for, because narrowing what an implied authorization reaches also narrowed what the model would call
+explicit. A pattern has no such blast radius.
+
+`ask` rather than `deny`, because rewriting history is legitimate, most often to expunge a leaked
+secret. It just needs the person who owns the branch to say so.
+
+`push --force` is deliberately **not** listed. A rule fires before the classifier. Listing it would
+refuse a force-push you asked for in plain words, without the model ever reading the request.
 
 ## Configuration
 
@@ -126,6 +228,7 @@ omp plugin config list omp-autoclassifier
 | `enabled` | `true` | Main switch |
 | `activeModes` | `yolo,write,always-ask` | Approval modes the gate runs in |
 | `escalate` | `false` | Prompt instead of blocking, in interactive sessions |
+| `suggestAlternative` | `false` | Ask the review stage for a safer command when it refuses one. Costs tokens on every review. |
 | `classifySubagents` | `true` | Classify calls inside spawned subagents |
 | `stage1TimeoutMs` | `4000` | Filter stage timeout |
 | `stage2TimeoutMs` | `10000` | Review stage timeout |
@@ -169,35 +272,59 @@ becomes a block, and no prompt can lift a classifier denial. The gate reports ev
 denial to the interactive sessions in the process, since a block buried in a subagent transcript would
 otherwise go unnoticed.
 
-## Circuit breaker
+## Two breakers, opposite directions
 
-After 3 consecutive or 20 total blocks in a session, the gate pauses itself, allows everything, and
-says so in the status line. Re-arm it with `/autoclassifier resume`.
+A run of refusals looks identical to a run of classifier failures, because both block. What each must
+cost is opposite, so the gate counts them apart.
 
-The breaker exists because fail-closed has a failure mode of its own: one broken classifier otherwise
-turns every call into a block, and the agent burns the session retrying. Resuming stays manual, since
-an automatic re-arm would walk straight back into the same wall.
+**Failures pause.** After 3 failures in a row, or 20 in a session, the gate pauses itself, allows
+everything, and says so in the status line. Fail-closed has a failure mode of its own: one unreachable
+classifier otherwise turns every call into a block and the agent burns the session retrying. Resuming
+stays manual, since an automatic re-arm walks back into the same wall.
+
+**Refusals lock.** After 3 consecutive refusals the session locks: every tool call is refused, reads
+included, until you run `/autoclassifier resume`. An allowed call in between clears the run. The agent is
+told the count on every refusal, and told plainly when the lock closes.
+
+A lock outranks a pause when both hold. A pause is convenience for a broken reviewer; a lock is a
+judgement about the agent, and convenience does not overrule judgement.
+
+Both numbers come from `maxConsecutiveDenials` and `maxTotalDenials`.
+
+### Why refusals lock instead of pausing
+
+One counter drove both at first, on the reasoning that the agent cannot tell the two apart. That put
+refusals on the pause path, so **three refused calls switched the gate off** and let everything through.
+Any agent that noticed could spend three calls to buy an unsupervised session, and warning it about the
+threshold would have published the recipe.
+
+Separating them inverts that. Persisting now costs the session rather than buying it, which is also what
+makes the countdown safe to state: an agent racing toward a lock gains nothing by arriving.
 
 ## Kill switches
 
-Layered, because a fail-closed gate can lock you out:
+Layered, because a fail-closed gate can stop a session:
 
 | Scope | Action |
 | --- | --- |
+| A locked session | `/autoclassifier resume` |
 | This session | `/autoclassifier off` |
 | This process | Start omp with `OMP_AUTOCLASSIFIER_DISABLE=1` |
 | Persistent | `omp plugin disable omp-autoclassifier` |
 
-Slash commands and environment variables are not tool calls, so the gate can never block them. The
-agent is hard-denied from touching any of the three.
+Slash commands and environment variables are not tool calls, so the gate can never block them. The agent
+is hard-denied from touching any of them, which is what keeps a lock the user's to lift.
 
 ## Audit log
 
 One JSON object per decision at `<agentDir>/autoclassifier/decisions.jsonl`:
 
 ```json
-{"timestamp":"2026-08-24T10:00:00.000Z","toolName":"bash","decision":"block","via":"classifier","risk":"high","stage":2,"reason":"Appends a key to authorized_keys.","hasUI":true}
+{"timestamp":"2026-08-24T10:00:00.000Z","toolName":"bash","target":"echo key >> ~/.ssh/authorized_keys","decision":"block","via":"classifier","stage":2,"risk":"high","category":"persistence","authorization":"absent","reversibility":"recoverable","scope":"machine","confidence":"high","injectionSuspected":false,"reason":"Appends a key to authorized_keys.","hasUI":true}
 ```
+
+`target` is the path or command the decision was about, on every entry rather than only on rule
+matches. Without it a log of six allowed `bash` calls says nothing about what ran.
 
 Read the recent entries with `/autoclassifier denials` or `/autoclassifier log`. When the gate cannot write the log, it drops the log rather than the gate.
 
@@ -216,16 +343,8 @@ Keep real isolation where it belongs: containers, credentials scoped to the job,
 
 ## Development
 
-```sh
-bun install
-bun run check        # tsc --noEmit
-bun test             # unit suite
-bun run test:mutate  # mutation harness
-bun run verify       # all three
-```
-
-The mutation harness breaks one behavior at a time and requires the test that owns it to fail. A test
-that survives its mutation is a test gap, not a passing implementation.
+Contributor setup, the calibration harness, and the noise-floor method live in
+[docs/development.md](docs/development.md).
 
 ## License
 

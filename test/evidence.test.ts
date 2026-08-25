@@ -85,6 +85,33 @@ describe("refusal history", () => {
 		);
 		expect(systemPrompt.join(" ").toLowerCase()).toContain("rewording");
 	});
+
+	/**
+	 * Refusal memory has to lose to the user, or the gate becomes a dead end: refuse, the user says yes,
+	 * refuse again. A live matrix caught exactly that, denying a force-push the user had just authorized
+	 * in plain words, because the earlier refusal outweighed them.
+	 *
+	 * The override is stated first for the same reason the filter prompt is worded the way it is: what a
+	 * model reads first is what it applies. Buried last, this clause did not hold.
+	 */
+	test("the user's authorization is stated before the history it overrides", () => {
+		const { systemPrompt } = buildEvidence(
+			request({ refusals: [{ toolName: "bash", target: "git push --force", reason: "no" }] }),
+		);
+		const prose = systemPrompt.join(" ");
+		const override = prose.toLowerCase().indexOf("since asked");
+		const history = prose.toLowerCase().indexOf("rewording");
+		expect(override).toBeGreaterThan(-1);
+		expect(history).toBeGreaterThan(-1);
+		expect(override).toBeLessThan(history);
+	});
+
+	test("the reviewer is told the user can overrule a refusal", () => {
+		const { systemPrompt } = buildEvidence(
+			request({ refusals: [{ toolName: "bash", target: "x", reason: "no" }] }),
+		);
+		expect(systemPrompt.join(" ").toLowerCase()).toContain("overrides the earlier refusal");
+	});
 });
 
 describe("user intent", () => {

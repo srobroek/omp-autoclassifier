@@ -308,7 +308,7 @@ describe("visibility", () => {
 		const h = harness();
 		await decide(h.deps, call({ toolName: "write", input: { path: "/agent/autoclassifier.yml" } }));
 		expect(h.notices.length).toBe(1);
-		expect(h.notices[0]).toContain("anti-tamper");
+		expect(h.notices[0]).toContain("autoclassifier blocked");
 	});
 
 	test("a classifier block notifies the user with the model's reason", async () => {
@@ -360,67 +360,129 @@ describe("deny messages", () => {
 		const h = harness({ verdict: risky });
 		const decision = await decide(h.deps, call({ input: { command: "echo key >> ~/.ssh/authorized_keys" } }));
 		if (decision.action !== "block") throw new Error("expected a block");
-		expect(decision.reason).toContain("bash");
-		expect(decision.reason).toContain("authorized_keys");
+		expect(JSON.parse(decision.reason)).toMatchObject({ tool: "bash" });
+		expect(JSON.parse(decision.reason).target).toContain("authorized_keys");
 	});
 
 	test("the agent is told which category and authorization decided it", async () => {
 		const h = harness({ verdict: risky });
 		const decision = await decide(h.deps, call());
 		if (decision.action !== "block") throw new Error("expected a block");
-		expect(decision.reason).toContain("persistence");
-		expect(decision.reason).toContain("absent");
-		expect(decision.reason).toContain("machine");
-		expect(decision.reason).toContain("recoverable");
+		expect(JSON.parse(decision.reason)).toMatchObject({ category: "persistence", authorization: "absent", scope: "machine", reversibility: "recoverable" });
 	});
 
 	test("the agent is given the model's own sentence, not just labels", async () => {
 		const h = harness({ verdict: risky });
 		const decision = await decide(h.deps, call());
 		if (decision.action !== "block") throw new Error("expected a block");
-		expect(decision.reason).toContain("grants future login");
+		expect(JSON.parse(decision.reason).why).toContain("grants future login");
 	});
 
-	test("the agent is told not to route around it", async () => {
+	/**
+	 * Codex's wording, which is the best of the three: after a rejection, proceed only with a materially
+	 * safer alternative, or tell the user the risk and ask. Two moves and no third, which closes the
+	 * reworded-retry vector by construction rather than by prohibition, since a reword is not safer.
+	 */
+	test("the agent is given two moves and no third", async () => {
 		const h = harness({ verdict: risky });
 		const decision = await decide(h.deps, call());
 		if (decision.action !== "block") throw new Error("expected a block");
-		expect(decision.reason.toLowerCase()).toContain("another route");
+		expect(JSON.parse(decision.reason).next).toContain("materially safer");
+		expect(JSON.parse(decision.reason).next).toContain("ask them for this specific action");
 	});
 
-	test("the user receives exactly what the agent received", async () => {
+	test("the routes around it are named as not counting", async () => {
 		const h = harness({ verdict: risky });
 		const decision = await decide(h.deps, call());
 		if (decision.action !== "block") throw new Error("expected a block");
-		expect(h.notices).toEqual([decision.reason]);
+		// The three the gate actually measured an agent trying.
+		expect(JSON.parse(decision.reason).notThis).toContain("Rewording this call");
+	});
+
+	/**
+	 * The two readers want different things, and sending one string to both served neither. An agent reads
+	 * the refusal as a tool error and acts on it, so it wants the axes as fields and an explicit next move.
+	 * A person reads the same refusal as a one-line notification while doing something else, so it wants the
+	 * call, the reason, and nothing about what the agent should do next.
+	 */
+	test("the agent gets the axes as labelled fields", async () => {
+		const h = harness({ verdict: risky });
+		const decision = await decide(h.deps, call({ input: { command: "git push --force origin main" } }));
+		if (decision.action !== "block") throw new Error("expected a block");
+		const parsed = JSON.parse(decision.reason) as Record<string, unknown>;
+		expect(parsed).toMatchObject({
+			autoclassifier: "blocked",
+			tool: "bash",
+			target: "git push --force origin main",
+			category: "persistence",
+			authorization: "absent",
+			risk: "high",
+		});
+		for (const field of ["reversibility", "scope", "why", "next", "notThis", "otherwise"]) {
+			expect(Object.keys(parsed), field).toContain(field);
+		}
+	});
+
+	test("the human gets one line, not the agent's instructions", async () => {
+		const h = harness({ verdict: risky });
+		await decide(h.deps, call({ input: { command: "git push --force origin main" } }));
+		expect(h.notices.length).toBe(1);
+		const notice = h.notices[0] ?? "";
+		expect(notice.split("\n").length).toBe(1);
+		expect(notice).toContain("bash");
+		expect(notice).toContain("git push --force origin main");
+		// The person is not the one being told what to do instead.
+		expect(notice).not.toContain("next:");
+		expect(notice).not.toContain("materially safer");
+	});
+
+	test("the human line still names the reason, not just the block", async () => {
+		const h = harness({ verdict: risky });
+		await decide(h.deps, call());
+		expect(h.notices[0]).toContain("persistence");
+		expect(h.notices[0]).toContain("Appends a key to authorized_keys");
+	});
+
+	test("a rule block splits the same way", async () => {
+		const h = harness();
+		await decide(h.deps, call({ toolName: "write", input: { path: "/agent/autoclassifier.yml" } }));
+		expect(h.notices.length).toBe(1);
+		expect(h.notices[0]?.split("\n").length).toBe(1);
 	});
 
 	test("a revoked authorization says the user already ruled it out", async () => {
 		const h = harness({ verdict: { ...risky, dimensions: dims({ authorization: "revoked" }) } });
 		const decision = await decide(h.deps, call());
 		if (decision.action !== "block") throw new Error("expected a block");
-		expect(decision.reason.toLowerCase()).toContain("ruled this out");
+		expect(JSON.parse(decision.reason).next.toLowerCase()).toContain("ruled this out");
 	});
 
 	test("a blocked ask says why it was not put to the user", async () => {
 		const h = harness({ verdict: { kind: "ask", reason: "Could go either way.", stage: 2, dimensions: dims() } });
 		const decision = await decide(h.deps, call());
 		if (decision.action !== "block") throw new Error("expected a block");
-		expect(decision.reason).toContain("escalation is off");
+		expect(JSON.parse(decision.reason)).toMatchObject({ wantedAHuman: true, escalation: "off" });
 	});
 
 	test("a suspected injection is called out as hostile content", async () => {
 		const h = harness({ verdict: { ...risky, dimensions: dims({ injectionSuspected: true }) } });
 		const decision = await decide(h.deps, call());
 		if (decision.action !== "block") throw new Error("expected a block");
-		expect(decision.reason.toLowerCase()).toContain("hostile");
+		expect(JSON.parse(decision.reason).injectionSuspected).toBe(true);
 	});
 
 	test("a suggested alternative is passed to the agent", async () => {
 		const h = harness({ verdict: { ...risky, dimensions: dims({ alternative: "git push --force-with-lease" }) } });
 		const decision = await decide(h.deps, call());
 		if (decision.action !== "block") throw new Error("expected a block");
-		expect(decision.reason).toContain("git push --force-with-lease");
+		expect(JSON.parse(decision.reason).safer).toBe("git push --force-with-lease");
+	});
+
+	test("the agent is pointed at other work", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+		const decision = await decide(h.deps, call());
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(JSON.parse(decision.reason).otherwise).toContain("does not depend on this");
 	});
 
 	test("every dimension reaches the audit record", async () => {
@@ -537,6 +599,14 @@ describe("audit target", () => {
 		await decide(h.deps, call({ input: { command: "bun test" } }));
 		expect(h.records[0]?.target).toBe("bun test");
 	});
+
+	/** The classifier path is the common one, and a refusal that does not say what it refused is useless. */
+	test("a classifier block names what it blocked", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+		await decide(h.deps, call({ toolName: "write", input: { path: "/etc/hosts" } }));
+		expect(h.records[0]?.target).toBe("/etc/hosts");
+	});
+
 	/**
 	 * A rule reports the path it actually matched, which is the resolved one. The raw argument may be
 	 * relative or contain traversal, and logging that instead would leave the reader to guess what the
@@ -953,13 +1023,228 @@ describe("bookkeeping", () => {
 		expect(decision.reason).toContain("anti-tamper rule");
 	});
 
-	test("a repeated denial eventually pauses the gate through the breaker", async () => {
+	/**
+	 * A run of refusals from a working reviewer locks the session rather than opening the gate. The earlier
+	 * design tripped on the same count and then allowed everything, which handed any agent a three-call
+	 * recipe for switching off its own supervision.
+	 */
+	test("a repeated denial locks the session instead of opening the gate", async () => {
 		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
 		for (const command of ["a", "b", "c"]) await decide(h.deps, call({ input: { command } }));
-		expect(h.state.paused).toBe(true);
+		expect(h.state.paused).toBe(false);
+		expect(h.state.locked).toBe(true);
 		const after = await decide(h.deps, call({ input: { command: "d" } }));
-		expect(after.action).toBe("allow");
+		expect(after.action).toBe("block");
+		expect(after.via).toBe("locked");
 	});
+
+	/**
+	 * A lock with a read-shaped hole in it invites the agent to keep gathering context and reformulating
+	 * the same refused action, which is the behaviour the lock exists to stop. Allowlisted calls are gated
+	 * too once it is on.
+	 */
+	test("a locked session refuses even an allowlisted read", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+		for (const command of ["a", "b", "c"]) await decide(h.deps, call({ input: { command } }));
+		const read = await decide(h.deps, call({ toolName: "read", input: { path: "/work/src/index.ts" } }));
+		expect(read.action).toBe("block");
+	});
+
+	/**
+	 * The agent has to be able to see the lock coming, or the cost of persisting is invisible until it is
+	 * already paid. Safe to state plainly only because the lock is strictly more restrictive than the gate:
+	 * an agent racing toward it gains nothing.
+	 */
+	test("a denial warns the agent how many refusals remain before the lock", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+		const first = await decide(h.deps, call({ input: { command: "a" } }));
+		if (first.action !== "block") throw new Error("expected a block");
+		expect(JSON.parse(first.reason).warning).toContain("2 more");
+	});
+
+	test("the warning names manual unlocking as the only way out of a lock", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+		for (const command of ["a", "b"]) await decide(h.deps, call({ input: { command } }));
+		const third = await decide(h.deps, call({ input: { command: "c" } }));
+		if (third.action !== "block") throw new Error("expected a block");
+		const warning = JSON.parse(third.reason).warning as string;
+		expect(warning).toContain("locked");
+		expect(warning).toContain("/autoclassifier resume");
+	});
+
+	test("a rule block carries the same lock warning as a judged one", async () => {
+		const h = harness({ cfg: { rules: { hardDeny: [], deny: ["computer"], ask: [], allow: [] } } });
+		const decision = await decide(h.deps, call({ toolName: "computer", input: {} }));
+		if (decision.action !== "block") throw new Error("expected a block");
+		expect(JSON.parse(decision.reason).warning).toContain("2 more");
+	});
+
+	/**
+	 * A locked session is the one state the user has to know about, because they are the only way out of it.
+	 * A refusal they can miss costs a course correction; a lock they miss costs the whole session.
+	 */
+	test("the user is told when the session locks", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+		for (const command of ["a", "b", "c"]) await decide(h.deps, call({ input: { command } }));
+		const lock = h.notices.filter(notice => notice.includes("locked this session"));
+		expect(lock).toHaveLength(1);
+		expect(lock[0]).toContain("/autoclassifier resume");
+	});
+
+	test("calls refused by the lock itself do not repeat the announcement", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+		for (const command of ["a", "b", "c", "d", "e"]) await decide(h.deps, call({ input: { command } }));
+		expect(h.notices.filter(notice => notice.includes("locked this session"))).toHaveLength(1);
+	});
+
+	test("a headless session announces nothing, since no one is watching", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+		for (const command of ["a", "b", "c"]) await decide(h.deps, call({ hasUI: false, input: { command } }));
+		expect(h.state.locked).toBe(true);
+		expect(h.notices).toEqual([]);
+	});
+
+	/**
+	 * Both states can hold at once — a session locks, the user pauses it, or a restore brings both back.
+	 * They have opposite effects, so precedence is the whole answer: a pause is convenience for a broken
+	 * reviewer, a lock is a judgement about the agent, and convenience must not overrule judgement.
+	 */
+	test("a lock outranks a pause when both hold", async () => {
+		const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+		for (const command of ["a", "b", "c"]) await decide(h.deps, call({ input: { command } }));
+		h.state.pause();
+		expect(h.state.locked).toBe(true);
+		expect(h.state.paused).toBe(true);
+		const decision = await decide(h.deps, call({ input: { command: "d" } }));
+		expect(decision.action).toBe("block");
+		expect(decision.via).toBe("locked");
+	});
+});
+
+/**
+ * The invariant behind the two channels, tested across every path rather than per path.
+ *
+ * Each block site was converted by hand, and the `ask`-rule one was missed: it kept returning prose while
+ * the rest returned JSON, and every per-path test still passed because none of them asserted the shape.
+ * Anything parsing a refusal would have hit the one exception. This test is the reason that cannot recur.
+ */
+describe("every refusal reaches the agent as JSON", () => {
+	const paths: { name: string; run: () => Promise<{ action: string; reason?: string }> }[] = [
+		{
+			name: "anti-tamper",
+			run: async () => await decide(harness().deps, call({ toolName: "write", input: { path: "/agent/autoclassifier.yml" } })),
+		},
+		{
+			name: "deny rule",
+			run: async () =>
+				await decide(
+					harness({ cfg: { rules: { hardDeny: [], deny: ["computer"], ask: [], allow: [] } } }).deps,
+					call({ toolName: "computer", input: {} }),
+				),
+		},
+		{
+			name: "ask rule with no prompt",
+			run: async () =>
+				await decide(
+					harness({ cfg: { rules: { hardDeny: [], deny: [], ask: ["computer"], allow: [] } } }).deps,
+					call({ toolName: "computer", input: {}, hasUI: false }),
+				),
+		},
+		{
+			name: "classifier deny",
+			run: async () =>
+				await decide(harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } }).deps, call()),
+		},
+		{
+			name: "classifier ask with escalation off",
+			run: async () =>
+				await decide(harness({ verdict: { kind: "ask", reason: "unsure", stage: 2, dimensions: dims() } }).deps, call()),
+		},
+		{
+			name: "classifier failure",
+			run: async () => await decide(harness({ verdict: { kind: "failure", reason: "down" } }).deps, call()),
+		},
+		{
+			name: "session locked",
+			run: async () => {
+				const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+				for (const command of ["a", "b", "c"]) await decide(h.deps, call({ input: { command } }));
+				return await decide(h.deps, call({ input: { command: "d" } }));
+			},
+		},
+	];
+
+	for (const path of paths) {
+		test(`a ${path.name} block parses as JSON and names the tool`, async () => {
+			const decision = await path.run();
+			if (decision.action !== "block") throw new Error(`expected a block from ${path.name}`);
+			const parsed = JSON.parse(decision.reason ?? "") as Record<string, unknown>;
+			expect(parsed.autoclassifier).toBe("blocked");
+			expect(typeof parsed.tool).toBe("string");
+			expect(typeof parsed.next).toBe("string");
+		});
+	}
+});
+
+/**
+ * The other half of the same invariant, and it needed its own sweep.
+ *
+ * Converting the agent channel to JSON left two paths sending the payload to the user's toast, and a
+ * rule block rendering an empty `()` where a category would go. The suite passed through both, because
+ * every existing assertion looked at substrings of the agent message. A live probe found them instead.
+ */
+describe("every refusal reaches the user as one prose line", () => {
+	const paths: { name: string; run: () => Promise<string[]> }[] = [
+		{
+			name: "anti-tamper",
+			run: async () => {
+				const h = harness();
+				await decide(h.deps, call({ toolName: "write", input: { path: "/agent/autoclassifier.yml" } }));
+				return h.notices;
+			},
+		},
+		{
+			name: "deny rule",
+			run: async () => {
+				const h = harness({ cfg: { rules: { hardDeny: [], deny: ["computer"], ask: [], allow: [] } } });
+				await decide(h.deps, call({ toolName: "computer", input: {} }));
+				return h.notices;
+			},
+		},
+		{
+			name: "classifier deny",
+			run: async () => {
+				const h = harness({ verdict: { kind: "deny", reason: "no", stage: 2, dimensions: dims() } });
+				await decide(h.deps, call());
+				return h.notices;
+			},
+		},
+		{
+			name: "classifier failure",
+			run: async () => {
+				const h = harness({ verdict: { kind: "failure", reason: "down" } });
+				await decide(h.deps, call());
+				return h.notices;
+			},
+		},
+	];
+
+	for (const path of paths) {
+		test(`a ${path.name} block tells the user in one line`, async () => {
+			const notices = await path.run();
+			expect(notices.length).toBeGreaterThan(0);
+			const first = notices[0] ?? "";
+			expect(first.split("\n")).toHaveLength(1);
+			// The agent's payload must never reach a toast.
+			expect(first.startsWith("{")).toBe(false);
+			expect(first).toContain("autoclassifier blocked");
+		});
+
+		test(`a ${path.name} block leaves no empty brackets in the user's line`, async () => {
+			const notices = await path.run();
+			expect(notices[0] ?? "").not.toContain("()");
+		});
+	}
 });
 
 describe("classifier input", () => {

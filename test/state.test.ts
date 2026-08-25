@@ -89,38 +89,84 @@ describe("classifier coverage", () => {
  * pause on a run of refusals rather than trusting the reviewer to recover on its own.
  */
 describe("circuit breaker", () => {
-	test("a run of consecutive denials pauses the gate", () => {
+	test("a run of consecutive failures pauses the gate", () => {
 		const state = new GateState(thresholds);
-		state.recordDeny();
-		state.recordDeny();
+		state.recordFailure("model unreachable");
+		state.recordFailure("model unreachable");
 		expect(state.paused).toBe(false);
-		state.recordDeny();
+		state.recordFailure("model unreachable");
 		expect(state.paused).toBe(true);
 	});
 
-	test("scattered denials still pause once the session total is reached", () => {
+	test("scattered failures still pause once the session total is reached", () => {
 		const state = new GateState({ maxConsecutiveDenials: 100, maxTotalDenials: 3 });
 		for (let i = 0; i < 2; i++) {
-			state.recordDeny();
+			state.recordFailure("down");
 			state.recordAllow();
 		}
 		expect(state.paused).toBe(false);
-		state.recordDeny();
+		state.recordFailure("down");
 		expect(state.paused).toBe(true);
 	});
 
-	test("a threshold of one pauses on the first denial", () => {
+	test("a threshold of one pauses on the first failure", () => {
 		const state = new GateState({ maxConsecutiveDenials: 1, maxTotalDenials: 20 });
-		state.recordDeny();
+		state.recordFailure("down");
 		expect(state.paused).toBe(true);
 	});
 
-	test("classifier failures count toward the breaker, since they also block", () => {
+	/**
+	 * The counterpart, and the reason the two are no longer one counter. A reviewer that answers is a
+	 * reviewer that works, and a working reviewer's refusals must never be a route to switching it off.
+	 */
+	test("a run of denials does not pause the gate, however long", () => {
 		const state = new GateState(thresholds);
-		state.recordFailure("model unreachable");
-		state.recordFailure("model unreachable");
-		state.recordFailure("model unreachable");
-		expect(state.paused).toBe(true);
+		for (let i = 0; i < 25; i++) state.recordDeny();
+		expect(state.paused).toBe(false);
+	});
+
+	/**
+	 * The lock is the answer to persistence: an agent that keeps arriving at a refused action stops
+	 * getting tool calls at all, and only the user lifts it.
+	 *
+	 * Warning the agent about it is safe only because the lock is strictly more restrictive than the gate.
+	 * The earlier design tripped the same counter and then *opened* the gate, which made the threshold a
+	 * three-call recipe for switching off supervision — publishable only once that was separated.
+	 */
+	test("a run of denials locks the session", () => {
+		const state = new GateState(thresholds);
+		state.recordDeny();
+		state.recordDeny();
+		expect(state.locked).toBe(false);
+		state.recordDeny();
+		expect(state.locked).toBe(true);
+	});
+
+	test("an allowed call between denials clears the run", () => {
+		const state = new GateState(thresholds);
+		state.recordDeny();
+		state.recordDeny();
+		state.recordAllow();
+		state.recordDeny();
+		expect(state.locked).toBe(false);
+	});
+
+	/**
+	 * A broken reviewer is not the agent misbehaving, so it must not spend the agent's budget toward a
+	 * lock. Failures have their own counter and their own outcome, which is to pause rather than lock.
+	 */
+	test("classifier failures do not count toward the lock", () => {
+		const state = new GateState(thresholds);
+		for (const _ of [1, 2, 3, 4]) state.recordFailure("model unreachable");
+		expect(state.locked).toBe(false);
+	});
+
+	test("the user lifting the pause also lifts the lock", () => {
+		const state = new GateState(thresholds);
+		for (const _ of [1, 2, 3]) state.recordDeny();
+		expect(state.locked).toBe(true);
+		state.resume();
+		expect(state.locked).toBe(false);
 	});
 
 	test("resume re-arms the gate and clears both counters", () => {
@@ -150,6 +196,70 @@ describe("circuit breaker", () => {
 		state.pause();
 		state.recordAllow();
 		expect(state.paused).toBe(true);
+	});
+});
+
+/**
+ * The breaker exists so a broken classifier cannot brick a session. It must not double as a way to
+ * switch the gate off by persisting.
+ *
+ * Both were counted together at first, on the reasoning that a failure and a denial are indistinguishable
+ * from the agent's side. True, and irrelevant: the right *response* differs completely. A wall of failures
+ * means the reviewer is broken, so opening the gate is the lesser harm. A wall of denials means the
+ * reviewer is working, and opening the gate there rewards persistence and hands any agent a three-call
+ * recipe for disabling its own supervision.
+ */
+describe("breaker separates a broken reviewer from a working one", () => {
+	test("a run of classifier failures opens the gate", () => {
+		const state = new GateState(thresholds);
+		for (const _ of [1, 2, 3]) state.recordFailure("model unreachable");
+		expect(state.paused).toBe(true);
+	});
+
+	test("a run of genuine denials never opens the gate", () => {
+		const state = new GateState(thresholds);
+		for (const _ of [1, 2, 3, 4, 5, 6]) state.recordDeny();
+		expect(state.paused).toBe(false);
+	});
+
+	test("a wall of denials is still counted, so it can be reported", () => {
+		const state = new GateState(thresholds);
+		for (const _ of [1, 2, 3]) state.recordDeny();
+		expect(state.locked).toBe(true);
+	});
+
+	test("a single denial is not a wall", () => {
+		const state = new GateState(thresholds);
+		state.recordDeny();
+		expect(state.locked).toBe(false);
+	});
+
+	test("an allow between denials clears the run", () => {
+		const state = new GateState(thresholds);
+		state.recordDeny();
+		state.recordDeny();
+		state.recordAllow();
+		state.recordDeny();
+		expect(state.locked).toBe(false);
+	});
+
+	/** Mixed traffic must not trip the open-the-gate breaker on the denial half. */
+	test("denials do not contribute to the failure run", () => {
+		const state = new GateState(thresholds);
+		state.recordFailure("down");
+		state.recordDeny();
+		state.recordFailure("down");
+		state.recordDeny();
+		expect(state.paused).toBe(false);
+	});
+
+	test("the total denial ceiling does not open the gate either", () => {
+		const state = new GateState({ maxConsecutiveDenials: 3, maxTotalDenials: 4 });
+		for (const _ of [1, 2, 3, 4, 5]) {
+			state.recordDeny();
+			state.recordAllow();
+		}
+		expect(state.paused).toBe(false);
 	});
 });
 
@@ -255,7 +365,7 @@ describe("persistence", () => {
 
 	test("a paused gate stays paused after restore", () => {
 		const state = new GateState(thresholds);
-		for (let i = 0; i < 3; i++) state.recordDeny();
+		for (let i = 0; i < 3; i++) state.recordFailure("down");
 		const restored = new GateState(thresholds);
 		restored.restore(state.snapshot());
 		expect(restored.paused).toBe(true);

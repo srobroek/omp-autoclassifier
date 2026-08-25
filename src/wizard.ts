@@ -23,6 +23,28 @@ export interface RankOptions {
 	family?: (model: WizardModel) => string;
 }
 
+/**
+ * Models measured on this gate's own matrix, best first. Ranked above every heuristic below, because a
+ * measurement beats a naming convention.
+ *
+ * From 193 cases at three repeats, `temperature: 0`, majority verdict. The column that decides a security
+ * gate is how much harm it let through, and it does not track the others:
+ *
+ *   model               harm allowed   unstable   effective   median   p95
+ *   claude-haiku-4-5               0     0/193     185/193   3449ms  4845ms
+ *   claude-sonnet-5                7         --     186/193   4516ms  9560ms
+ *   gpt-5.6-luna                  13    12/193     179/193   1755ms  3131ms
+ *   gpt-5.6-terra                 14         --     179/193   1866ms  3952ms
+ *
+ * `terra` scored highest of the four on exact matching and allowed the most harm, so exact matching is
+ * not the metric. `haiku` costs about 1.7s more per verdict than `luna` and lets nothing through, which is
+ * the trade this gate exists to make.
+ *
+ * One account, one prompt revision, one matrix. Re-measure with `ac_model_bakeoff` before trusting the
+ * order, and treat an unlisted model as unknown rather than bad.
+ */
+const MEASURED_BEST = [/claude-haiku-4-5/i, /claude-sonnet-5/i];
+
 /** Roles that already mean "the cheap one" in omp's own vocabulary. */
 const CHEAP_ROLES = ["smol", "tiny"];
 
@@ -40,12 +62,19 @@ function roleNames(value: string, model: WizardModel): boolean {
 
 /** Lower sorts first. */
 function score(model: WizardModel, options: RankOptions): number {
+	// A measurement outranks every heuristic. Cheapness used to win here, which picked the model that let
+	// the most harm through on the account this was measured on.
+	const measured = MEASURED_BEST.findIndex(pattern => pattern.test(model.id) || pattern.test(model.name));
+	if (measured !== -1) return measured;
+
+	// Below the measured set, the user's own cheap roles still beat a name match: they name a model that
+	// account is known to have credentials for.
 	for (const role of CHEAP_ROLES) {
 		const configured = options.roles[role];
-		if (configured !== undefined && roleNames(configured, model)) return 0;
+		if (configured !== undefined && roleNames(configured, model)) return MEASURED_BEST.length;
 	}
 
-	let rank = CHEAP_NAME.test(model.id) || CHEAP_NAME.test(model.name) ? 1 : 2;
+	let rank = MEASURED_BEST.length + (CHEAP_NAME.test(model.id) || CHEAP_NAME.test(model.name) ? 1 : 2);
 
 	const current = options.current;
 	if (current !== undefined) {

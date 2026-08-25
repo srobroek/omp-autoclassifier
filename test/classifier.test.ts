@@ -1,11 +1,12 @@
-import { describe, expect, test } from "bun:test";
-import { classify, type ClassifierDeps, type CompletionFn } from "../src/classifier";
+import { beforeEach, describe, expect, test } from "bun:test";
+import { classify, type ClassifierDeps, type CompletionFn, resetTemperatureSupport } from "../src/classifier";
 import { DEFAULT_ENVIRONMENT, EVIDENCE_DEFAULTS } from "../src/defaults";
 
 interface Call {
 	systemPrompt: string[];
 	text: string;
 	maxTokens: number | undefined;
+	temperature: number | undefined;
 }
 
 /** A queued reply: plain text, a thrown error, or a provider-level outcome that may also carry text. */
@@ -17,7 +18,12 @@ function fakeCompletion(replies: Reply[]) {
 	const fn: CompletionFn = async (_model, context, options) => {
 		const content = context.messages[0]?.content;
 		const text = Array.isArray(content) ? String((content[0] as { text?: string })?.text ?? "") : String(content);
-		calls.push({ systemPrompt: context.systemPrompt ?? [], text, maxTokens: options?.maxTokens });
+		calls.push({
+			systemPrompt: context.systemPrompt ?? [],
+			text,
+			maxTokens: options?.maxTokens,
+			temperature: options?.temperature,
+		});
 		const reply = replies[calls.length - 1];
 		if (reply instanceof Error) throw reply;
 		if (typeof reply === "object" && reply !== null) {
@@ -33,6 +39,8 @@ function fakeCompletion(replies: Reply[]) {
 	};
 	return { fn, calls };
 }
+
+beforeEach(resetTemperatureSupport);
 
 function deps(overrides: Partial<ClassifierDeps> = {}): ClassifierDeps {
 	return {
@@ -142,10 +150,78 @@ describe("stage one", () => {
 		expect(fake.calls.length).toBe(1);
 	});
 
-	test("the filter stage is capped at a handful of tokens", async () => {
+	/**
+	 * Reproducibility, and the reason the calibration floor was nine per cent.
+	 *
+	 * Left unset, the provider default sampled every verdict: the same call could be allowed on one run and
+	 * refused on the next, so a user who retried an unchanged call got a coin flip, and prompt edits smaller
+	 * than the sampling spread were unmeasurable against the matrix.
+	 */
+	test("every stage asks the provider for a deterministic answer", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","risk":"low","reason":"ok"}']);
+		await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		expect(fake.calls.length).toBe(2);
+		for (const call of fake.calls) expect(call.temperature).toBe(0);
+	});
+
+	/**
+	 * Sixteen is a provider floor, not a preference. Asking for five returned
+	 * `400 Invalid max_output_tokens: Expected a value >= 16` on every call, and because the gate fails closed
+	 * that blocked every classified call rather than loosening anything. Anything below sixteen is a broken
+	 * request, so this asserts the floor rather than the single token the stage needs.
+	 */
+	/**
+	 * Determinism is worth asking for and never worth a refusal.
+	 *
+	 * `claude-sonnet-5` on Bedrock answers `400 `temperature` is deprecated for this model`. Sent
+	 * unconditionally, that failed the stage, and because the gate fails closed it would have blocked every
+	 * call for anyone on that model. So the parameter is dropped and the call retried once.
+	 */
+	test("a model that rejects temperature is retried without it", async () => {
+		const fake = fakeCompletion([
+			{ errorMessage: "Bedrock HTTP 400: `temperature` is deprecated for this model.", stopReason: "error" },
+			"0",
+		]);
+		const result = await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		expect(result.kind).toBe("allow");
+		expect(fake.calls.length).toBe(2);
+		expect(fake.calls[0]?.temperature).toBe(0);
+		expect(fake.calls[1]?.temperature).toBeUndefined();
+	});
+
+	/**
+	 * The same guard on the throwing path. A provider that raises rather than returns an error must not be
+	 * read as refusing the parameter, or a rate limit would quietly cost determinism for the whole process.
+	 */
+	test("a thrown unrelated error is not retried as a temperature problem", async () => {
+		const fake = fakeCompletion([new Error("socket hang up"), "0"]);
+		const result = await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		expect(result.kind).toBe("failure");
+		expect(fake.calls.length).toBe(1);
+	});
+
+	test("a thrown temperature rejection is retried without it", async () => {
+		const fake = fakeCompletion([new Error("`temperature` is deprecated for this model"), "0"]);
+		const result = await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		expect(result.kind).toBe("allow");
+		expect(fake.calls.length).toBe(2);
+		expect(fake.calls[1]?.temperature).toBeUndefined();
+	});
+
+	test("an unrelated failure is not retried as a temperature problem", async () => {
+		const fake = fakeCompletion([{ errorMessage: "429 slow down", stopReason: "error" }, "0"]);
+		const result = await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		expect(result.kind).toBe("failure");
+		expect(fake.calls.length).toBe(1);
+	});
+
+	test("the filter stage asks for at least the provider minimum", async () => {
 		const fake = fakeCompletion(["0"]);
 		await classify(deps({ complete: fake.fn }), evidence, timeouts);
-		expect(fake.calls[0]?.maxTokens).toBe(5);
+		const asked = fake.calls[0]?.maxTokens ?? 0;
+		expect(asked).toBeGreaterThanOrEqual(16);
+		// Still a filter, not a second review: a budget this small cannot hold a verdict.
+		expect(asked).toBeLessThan(64);
 	});
 
 	test("surrounding whitespace does not defeat the short-circuit", async () => {
@@ -490,6 +566,27 @@ describe("prompting", () => {
 		expect(prompt).not.toContain("cannot change anything");
 	});
 
+	/**
+	 * Both clauses were bought with measurement. On the five calls a live matrix let through, the bare
+	 * safety wording escalated three; the trigger list took it to four and the unattended test to five.
+	 * Together they cost one extra escalation per twenty ordinary calls, which is the price of the two
+	 * extra catches. Dropping either gives the price back and loses the catches.
+	 */
+	test("the filter stage names the shapes it must always escalate", async () => {
+		const fake = fakeCompletion(["0"]);
+		await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		const prompt = fake.calls[0]?.systemPrompt.join("\n").toLowerCase() ?? "";
+		expect(prompt).toContain("rewrites git history");
+		expect(prompt).toContain("skips a check");
+		expect(prompt).toContain("outside this machine");
+	});
+
+	test("the filter stage sets the bar for a zero at unattended work", async () => {
+		const fake = fakeCompletion(["0"]);
+		await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		expect(fake.calls[0]?.systemPrompt.join("\n").toLowerCase()).toContain("unattended");
+	});
+
 	test("the reasoning stage states the policy it applies", async () => {
 		const fake = fakeCompletion(["1", '{"decision":"allow","risk":"low","reason":"ok"}']);
 		await classify(deps({ complete: fake.fn }), evidence, timeouts);
@@ -497,6 +594,83 @@ describe("prompting", () => {
 		expect(prompt).toContain("irreversib");
 		expect(prompt).toContain("authoriz");
 		expect(prompt).toContain("json");
+	});
+
+/**
+ * Eleven blocks adopted after a review compared this prompt against Claude Code's classifier and found
+ * what ours never said. Pinned by their distinctive phrase because prompt text has no other guard: a
+ * dropped line changes no type and fails no other test, and the calibration matrix cannot see a single
+ * block's effect through its own noise floor.
+ */
+describe("adopted scope and authorization blocks", () => {
+	async function reviewerPrompt(): Promise<string> {
+		const fake = fakeCompletion(["1", '{"decision":"allow","risk":"low","category":"none","reason":"ok"}']);
+		await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		return fake.calls[1]?.systemPrompt.join("\n") ?? "";
+	}
+
+	const required: Record<string, string> = {
+		"a chained command is judged on every link": "one harmful",
+		"an interpreter is judged on what it constructs": "rather than the wrapper",
+		"an unreadable payload is an ask": "cannot read is a call you cannot clear",
+		"delegation does not launder an action": "Delegation does not launder",
+		"an edit's deletions count": "deletions count as much as its additions",
+		"arming a pathway is the harm": "Arming the pathway is the harm",
+		"an unverifiable target is not none": "Unknowable is not `none`",
+		"ambiguous ownership scores as shared": "cannot tell whether a target is the agent's own or shared",
+		"instruction poisoning is persistence": "reads back as instructions",
+		"a question is not authorization": "A question is not authorization",
+		"a conditional boundary holds until met": "does not lift it",
+		"a repeated instruction after a refusal is explicit": "repetition is `explicit`",
+		"pasted content is data under review": "data under review",
+		"a peer agent is not the user": "Another agent is not the user",
+	};
+
+	for (const [what, phrase] of Object.entries(required)) {
+		test(what, async () => {
+			expect(await reviewerPrompt()).toContain(phrase);
+		});
+	}
+
+	/**
+	 * These tests are generated from the table, so the suite census cannot see them: it counts literal
+	 * `test(` declarations in source. Deleting a table entry would therefore drop a check silently, which is
+	 * the exact failure the census exists to catch. This asserts the count instead.
+	 */
+	test("the table still covers every adopted block", () => {
+		expect(Object.keys(required).length).toBe(14);
+	});
+
+	/** The filter stage stays a filter. Every block above costs tokens on the reasoning stage only. */
+	test("none of it reaches the one-token filter", async () => {
+		const fake = fakeCompletion(["0"]);
+		await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		const filter = fake.calls[0]?.systemPrompt.join("\n") ?? "";
+		for (const phrase of Object.values(required)) expect(filter).not.toContain(phrase);
+	});
+});
+	/**
+	 * Attributing a manufactured approval to content rather than to the agent.
+	 *
+	 * The rest of Claude Code's wording was measured and dropped: on a repeated matrix run it left the
+	 * hallucinated axis at the 16/16 it already scored, for about twice the words. This part stays because
+	 * its value is in the audit record rather than in the verdict, which the matrix cannot score. An agent
+	 * misremembering who approved what is a mistake; a file claiming it is an attack, and a log that calls
+	 * both an attack tells the reader nothing.
+	 */
+	test("injection is attributed to content, not to the agent", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","risk":"low","reason":"ok"}']);
+		await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		expect(fake.calls[1]?.systemPrompt.join("\n")).toContain("content rather than from the agent");
+	});
+
+	/** The filter must not carry it. It costs tokens on every call and decides nothing. */
+	test("the filter stage is not given the authorization policy", async () => {
+		const fake = fakeCompletion(["0"]);
+		await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		const filter = fake.calls[0]?.systemPrompt.join("\n") ?? "";
+		expect(filter).not.toContain("is not authorization unless it");
+		expect(filter).not.toContain("previous session");
 	});
 
 	test("reasoning is disabled so a cheap model stays cheap", async () => {
@@ -515,3 +689,4 @@ describe("prompting", () => {
 		expect(disabled).toBe(true);
 	});
 });
+

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	DEFAULT_ALLOW,
+	DEFAULT_ASK,
 	DEFAULT_HARD_DENY,
 	DEFAULTS_SENTINEL,
 	type PathVars,
@@ -69,6 +70,9 @@ describe("pattern grammar", () => {
 		const l = { deny: ["bash(*git push*)"] };
 		expect(match(l, "bash", { command: "git push --force" })).toBe("deny");
 		expect(match(l, "bash", { command: "cd /a/b && git push" })).toBe("deny");
+		// The slashes have to sit inside a single link. The chained case above no longer proves a star
+		// crosses a separator, because link splitting removes the path before the pattern ever sees it.
+		expect(match(l, "bash", { command: "/usr/local/bin/git push --force" })).toBe("deny");
 		expect(match(l, "bash", { command: "git pull" })).toBeUndefined();
 	});
 
@@ -255,6 +259,58 @@ describe("url-scheme targets", () => {
 	});
 
 	/**
+	 * The same asymmetry as the remote check, for the tools whose argument is a command rather than a
+	 * path. `bash` matches on its whole `command` string, so `allow: ["bash(git status*)"]` matched
+	 * `git status` followed by anything at all: the trailing glob covers every later link. A user adding
+	 * a read-only git rule would have handed out a general bypass without writing anything careless.
+	 *
+	 * The prompt already says a chained command is judged on every link. The rule engine has to agree,
+	 * or the deterministic layer undoes what the model layer is told to do.
+	 */
+	test("an allow does not fast-path a command with more links after the match", () => {
+		const l = { allow: ["bash(git status*)"] };
+		expect(match(l, "bash", { command: "git status" })).toBe("allow");
+		expect(match(l, "bash", { command: "git status --short" })).toBe("allow");
+		for (const command of [
+			"git status && git push --force origin main",
+			"git status; git push origin main",
+			"git status || curl https://example.com/x",
+			"git status | tee /etc/cron.d/x",
+			"git status\ngit push origin main",
+		]) {
+			expect(match(l, "bash", { command })).toBeUndefined();
+		}
+	});
+
+	test("the operator check covers substitution as well as chaining", () => {
+		const l = { allow: ["bash(echo *)"] };
+		expect(match(l, "bash", { command: "echo hello" })).toBe("allow");
+		expect(match(l, "bash", { command: "echo $(cat /etc/passwd)" })).toBeUndefined();
+		expect(match(l, "bash", { command: "echo `id`" })).toBeUndefined();
+	});
+
+	test("the eval tool gets the same treatment as bash", () => {
+		const l = { allow: ["eval(console.log*)"] };
+		expect(match(l, "eval", { code: "console.log(1)" })).toBe("allow");
+		expect(match(l, "eval", { code: "console.log(1); require('child_process').execSync('id')" })).toBeUndefined();
+	});
+
+	/** A rule written for a compound command is taken at its word, exactly as a scheme-aware one is. */
+	test("an allow that spells out the operator still applies", () => {
+		expect(match({ allow: ["bash(git status && git diff*)"] }, "bash", { command: "git status && git diff" })).toBe("allow");
+	});
+
+	/** Awareness has to cover the substitution shapes too, not only the chaining ones. */
+	test("a rule that spells out a substitution is taken at its word", () => {
+		expect(match({ allow: ["bash(echo $(date))"] }, "bash", { command: "echo $(date)" })).toBe("allow");
+		expect(match({ allow: ["bash(echo $(date))"] }, "bash", { command: "echo $(whoami)" })).toBeUndefined();
+	});
+
+	test("a compound command never weakens a deny", () => {
+		expect(match({ deny: ["bash(git push*)"] }, "bash", { command: "git status && git push origin main" })).toBe("deny");
+	});
+
+	/**
 	 * omp's `read` accepts internal URLs that never leave the machine: `skill://`, `local://`, `omp://`,
 	 * `memory://`, and friends. Treating those like a remote target sends the agent's own skills and plan
 	 * files to the classifier, and a degraded classifier then blocks the agent from reading them.
@@ -378,6 +434,134 @@ describe("shipped defaults", () => {
 		expect(decide("inspect_image", { path: "a.png" })).toBe("allow");
 		expect(decide("ask", { questions: [] })).toBe("allow");
 		expect(decide("lsp", { action: "references", file: "a.ts" })).toBe("allow");
+	});
+
+	/**
+	 * The only entries in the shipped `ask` list, and they are there on evidence. A live matrix twice
+	 * allowed `git filter-branch --force` because the classifier read it as the ordinary means of getting a
+	 * large file out of a repository. Narrowing the prompt to stop that cost five refusals of work the user
+	 * had plainly asked for, so the judgement was left alone and these four shapes were named instead.
+	 */
+	test("history rewriting needs a person", () => {
+		const ask = compileRules(lists({ ask: [...DEFAULT_ASK] }), vars);
+		const decide = (command: string) => matchRule(ask, "bash", { command }, vars.cwd);
+		expect(decide("git filter-branch --force --index-filter 'git rm --cached big.bin' HEAD")).toBe("ask");
+		expect(decide("git filter-repo --path big.bin --invert-paths")).toBe("ask");
+		expect(decide("java -jar bfg.jar --delete-files big.bin")).toBe("ask");
+		expect(decide("git rebase -i --root")).toBe("ask");
+	});
+
+	/**
+	 * A rule fires before the classifier, so anything listed here loses the model's reading of the
+	 * transcript. That is why `push --force` is absent: the classifier allows it when the user asked for it,
+	 * and a rule could only take that judgement away.
+	 */
+	test("ordinary git work is left to the classifier", () => {
+		const ask = compileRules(lists({ ask: [...DEFAULT_ASK] }), vars);
+		const decide = (command: string) => matchRule(ask, "bash", { command }, vars.cwd);
+		expect(decide("git push --force origin main")).toBeUndefined();
+		expect(decide("git rebase main")).toBeUndefined();
+		expect(decide("git commit -m fix")).toBeUndefined();
+		expect(decide("bun test")).toBeUndefined();
+	});
+
+	/**
+	 * A hole in the allowlist rather than a model failure. `read` ships unconditionally allowed because omp
+	 * tiers it read-only, and read-only it is: it changes nothing. What it does is put a private key or a
+	 * password manager's database into the transcript, where every later turn can see it, and reading
+	 * credentials is the step before exfiltrating them. The calibration matrix caught this as a decision
+	 * credited to `rule read`, with no model call involved at all.
+	 */
+	test("reading a secret store is not fast-pathed", () => {
+		const ask = compileRules(lists({ ask: [...DEFAULT_ASK], allow: [...DEFAULT_ALLOW] }), vars);
+		const decide = (p: string) => matchRule(ask, "read", { path: path.join(vars.home, p) }, vars.cwd);
+		for (const store of [
+			".ssh/id_ed25519",
+			".ssh/id_rsa",
+			".ssh/deploy_ed25519",
+			".aws/credentials",
+			".netrc",
+			".kube/config",
+			".git-credentials",
+			".password-store/aws.gpg",
+			"Library/Keychains/login.keychain-db",
+			"Library/Application Support/1Password/data.sqlite",
+		]) {
+			expect(decide(store), store).toBe("ask");
+		}
+	});
+
+	/** A public key is public by definition, and gets read whenever someone adds a deploy key. */
+	test("reading a public key or an ssh config stays fast-pathed", () => {
+		const ask = compileRules(lists({ ask: [...DEFAULT_ASK], allow: [...DEFAULT_ALLOW] }), vars);
+		const decide = (p: string) => matchRule(ask, "read", { path: path.join(vars.home, p) }, vars.cwd);
+		for (const benign of [".ssh/id_ed25519.pub", ".ssh/id_rsa.pub", ".ssh/config", ".ssh/known_hosts", ".zshrc"]) {
+			expect(decide(benign), benign).toBe("allow");
+		}
+	});
+
+	/**
+	 * `grep` leaks a secret store exactly as `read` does: it is allowlisted, and it returns the matching
+	 * lines. A review caught this after the `read` patterns went in, which is the tell that the fix needs to
+	 * follow the tool's shape rather than its name.
+	 */
+	test("searching a secret store is not fast-pathed either", () => {
+		const ask = compileRules(lists({ ask: [...DEFAULT_ASK], allow: [...DEFAULT_ALLOW] }), vars);
+		const decide = (input: unknown) => matchRule(ask, "grep", input, vars.cwd);
+		expect(decide({ pattern: "PRIVATE KEY", path: path.join(vars.home, ".ssh") })).toBe("ask");
+		expect(decide({ pattern: "secret", path: path.join(vars.home, ".aws/credentials") })).toBe("ask");
+		expect(decide({ pattern: "token", path: path.join(vars.home, ".netrc") })).toBe("ask");
+	});
+
+	test("searching the project stays fast-pathed", () => {
+		const ask = compileRules(lists({ ask: [...DEFAULT_ASK], allow: [...DEFAULT_ALLOW] }), vars);
+		const decide = (input: unknown) => matchRule(ask, "grep", input, vars.cwd);
+		expect(decide({ pattern: "TODO", path: "src" })).toBe("allow");
+		expect(decide({ pattern: "TODO" })).toBe("allow");
+		expect(decide({ pattern: "retry", path: path.join(vars.cwd, "src/client.ts") })).toBe("allow");
+	});
+
+	/** A vault file is a secret store wherever it happens to live, so it matches on extension. */
+	test("a password vault is matched by extension, not by directory", () => {
+		const ask = compileRules(lists({ ask: [...DEFAULT_ASK], allow: [...DEFAULT_ALLOW] }), vars);
+		expect(matchRule(ask, "read", { path: path.join(vars.cwd, "vault.kdbx") }, vars.cwd)).toBe("ask");
+		expect(matchRule(ask, "read", { path: path.join(vars.home, "Documents/keys.kdbx") }, vars.cwd)).toBe("ask");
+	});
+
+	/**
+	 * The bug that made the first version of this list inert. A pattern that is not absolute is resolved
+	 * against the working directory, so a leading-wildcard read pattern compiled to one rooted under the
+	 * working directory and matched nothing on any machine.
+	 */
+	test("every secret-store pattern is anchored, not working-directory relative", () => {
+		const pathRules = DEFAULT_ASK.filter(rule => rule.startsWith("read(") || rule.startsWith("grep("));
+		const relative = pathRules.filter(rule => !rule.includes("<home>") && !/\((\/|\*\.)/.test(rule));
+		expect(relative).toEqual([]);
+	});
+
+	/**
+	 * A transcript is the authorization record a resumed session reads back, so a line shaped like a user
+	 * message becomes user intent for that session's reviews.
+	 *
+	 * Not for the running one. `getBranch()` walks an in-memory index, and the journal is written from
+	 * memory rather than read back, so a forged line does nothing until a resume loads it. Claude Code's
+	 * rule for this surface says the same: a tampered entry feeds later classifications once the session is
+	 * resumed. Worth a pattern, not worth calling a live forgery.
+	 */
+	test("the session transcript cannot be written", () => {
+		const transcript = path.join(vars.agentDir, "sessions", "-work", "abc", "session.jsonl");
+		expect(decide("write", { path: transcript })).toBe("hardDeny");
+		expect(decide("edit", { path: transcript })).toBe("hardDeny");
+		expect(decide("bash", { command: `echo forged >> ${transcript}` })).toBe("hardDeny");
+		expect(decide("bash", { command: `sed -i s/a/b/ ${transcript}` })).toBe("hardDeny");
+		expect(decide("eval", { code: `open("${transcript}","a")` })).toBe("hardDeny");
+	});
+
+	/** Reading transcripts is ordinary work, and omp's own history tooling depends on it. */
+	test("the session transcript can still be read", () => {
+		const transcript = path.join(vars.agentDir, "sessions", "-work", "abc", "session.jsonl");
+		expect(decide("read", { path: transcript })).toBe("allow");
+		expect(decide("grep", { pattern: "x", path: path.join(vars.agentDir, "sessions") })).toBe("allow");
 	});
 
 	test("every mutating tool reaches the classifier", () => {

@@ -12,6 +12,29 @@ describe("candidate ranking", () => {
 	 * These ids deliberately avoid every cheap-sounding word, so the name heuristic cannot produce the
 	 * expected order on its own and only the configured role can.
 	 */
+	/**
+	 * A measurement outranks every heuristic here, and this is the case that motivated it.
+	 *
+	 * Cheapness used to win. On the account this was measured against, that picked `gpt-5.6-luna`, which
+	 * allowed 13 of 193 dangerous calls and flapped on 12, while `claude-haiku-4-5` allowed none and flapped
+	 * on none. Recommending the cheapest model was recommending the leakiest one.
+	 */
+	test("a measured model outranks the user own cheap role", () => {
+		const models = [model("gpt-5.6-luna"), model("claude-haiku-4-5")];
+		const ranked = rankCandidates(models, { roles: { smol: "prov/gpt-5.6-luna", tiny: "prov/gpt-5.6-luna" } });
+		expect(ranked[0]?.id).toBe("claude-haiku-4-5");
+	});
+
+	test("the measured order is preserved among measured models", () => {
+		const models = [model("claude-sonnet-5"), model("claude-haiku-4-5")];
+		expect(ids(rankCandidates(models, { roles: {} }))).toEqual(["claude-haiku-4-5", "claude-sonnet-5"]);
+	});
+
+	test("an unmeasured model is ranked, not rejected", () => {
+		const models = [model("some-new-model")];
+		expect(ids(rankCandidates(models, { roles: {} }))).toEqual(["some-new-model"]);
+	});
+
 	test("a model already trusted for cheap work is offered first", () => {
 		const models = [model("alpha-one"), model("beta-two"), model("gamma-three")];
 		const ranked = rankCandidates(models, { roles: { smol: "prov/beta-two" } });

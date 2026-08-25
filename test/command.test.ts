@@ -119,6 +119,25 @@ describe("status", () => {
 		expect(text).toContain("model unreachable");
 	});
 
+	/**
+	 * The lock and the pause have opposite effects, so a status line that confuses them tells the user their
+	 * session is permissive at the moment it is actually stopped.
+	 */
+	test("status reports a lock, and says only the user can lift it", async () => {
+		const h = harness({ role: "prov/cheap-1" });
+		for (const _ of [1, 2, 3]) h.state.recordDeny();
+		await runCommand(h.deps, "status");
+		expect(say(h)).toContain("locked");
+		expect(say(h)).toContain("/autoclassifier resume");
+	});
+
+	test("status does not call a locked session paused", async () => {
+		const h = harness({ role: "prov/cheap-1" });
+		for (const _ of [1, 2, 3]) h.state.recordDeny();
+		await runCommand(h.deps, "status");
+		expect(say(h)).not.toContain("Every call is allowed");
+	});
+
 	test("status shows the counters", async () => {
 		const h = harness({ role: "prov/cheap-1" });
 		h.state.recordAllow();

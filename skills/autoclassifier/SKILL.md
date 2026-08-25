@@ -10,22 +10,54 @@ ahead of omp's approval gate, so it stays active even under `tools.approvalMode:
 
 ## Read a block message
 
-The tool error names the layer that decided. Read that first.
+The tool error is JSON. Read `via` first: it names the layer that decided.
 
-| Reason mentions | Cause | Response |
+| `via` | Cause | Response |
 | --- | --- | --- |
 | `anti-tamper rule` | The call targeted the gate's own configuration | Stop. Ask the user to edit it. |
-| `deny rule` | A configured deny pattern matched | Name the rule to the user. Do not work around it. |
-| `requires confirmation` | An `ask` rule matched with no prompt available | Tell the user. Offer `/autoclassifier` as the next step. |
-| `blocked as high/medium/low risk` | The classifier judged the action | Report the stated reason. |
-| `could not reach a verdict` | The classifier failed | The gate blocks everything. Report it. Do not retry. |
+| `deny rule` | A configured deny pattern matched | Name `rule` to the user. Do not work around it. |
+| `ask rule` | An `ask` rule matched with no prompt available | Tell the user. Offer `/autoclassifier` as the next step. |
+| `session locked` | Too many refusals in a row | Every call is refused. Ask the user to run `/autoclassifier resume`. |
+| `classifier unreachable` | The classifier failed | The gate refuses everything. Report it. Do not retry. |
+
+With no `via`, the classifier judged the call. Then `category`, `authorization`, `risk`,
+`reversibility`, and `scope` name the axes, `why` carries the model's own sentence, and `next` states
+what to do. When `wantedAHuman` is set, it asked for a person and escalation is off.
+
+Report `why` and the axis that refused. Do not paraphrase a refusal into something milder.
 
 A block never means "find another route". Rewriting a blocked `write` as a `bash` heredoc, or a blocked
 `bash` as an `eval`, counts as circumvention. The gate classifies those forms too, so the retry wastes
 the user's tokens. State what the gate blocked and why. Stop there.
 
-The gate caches no denials. Once the user authorizes the action in chat, try again. The gate
-reclassifies the call and reads their message as evidence.
+Splitting a refused call into smaller steps, or delegating it to a subagent, is the same circumvention.
+The gate records every refusal and shows it to each later review, including reviews inside subagents you
+spawn, so a reworded request is judged as the retry it is.
+
+## Watch the lock countdown
+
+Every refusal carries a `warning` field with the count remaining. Three refusals in a row lock the
+session: after that the gate refuses every tool call, reads included, until the user runs
+`/autoclassifier resume`. One allowed call in between clears the run.
+
+So persisting is worse than stopping. A refusal you accept costs one call. A refusal you keep working
+around costs the user their session, and only they can restart it. When the count reaches one, stop and
+ask rather than spend the last attempt.
+
+Classifier failures are counted apart and never lock the session, so a broken model cannot strand you.
+
+## Know which refusals lift
+
+Two refusals behave differently on retry:
+
+- **A classifier refusal** is not cached. Once the user authorizes that specific action in chat, try
+  again: the call is reclassified and their message counts as authorization.
+- **An anti-tamper refusal cannot be lifted from chat at all.** No amount of authorization in the
+  conversation opens it, because the whole point is that the agent cannot reach the gate's own settings.
+  The user has to make that change themselves.
+
+Never claim the user approved something they did not. Only their own messages authorize anything, so
+asserting an approval that is not in the transcript cannot work and reads as an attack.
 
 ## Leave the gate's own configuration alone
 

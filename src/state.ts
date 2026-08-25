@@ -61,7 +61,9 @@ export class GateState {
 	#allowed = 0;
 	#denied = 0;
 	#classified = 0;
-	#consecutive = 0;
+	#consecutiveDenials = 0;
+	#consecutiveFailures = 0;
+	#totalFailures = 0;
 	#paused = false;
 	#degradedReason: string | undefined;
 	/** Failure classes already announced this session, so a degraded gate notifies once, not per call. */
@@ -76,6 +78,22 @@ export class GateState {
 		return this.#paused;
 	}
 
+	/**
+	 * True on a run of refusals from a working reviewer. Reported, never acted on by opening the gate.
+	 *
+	 * The distinction from `paused` is the whole point. A run of *failures* means the reviewer is broken
+	 * and refusing everything for reasons unrelated to the calls, so opening the gate is the lesser harm.
+	 * A run of *denials* means the reviewer is working. Opening the gate there rewards persistence and
+	 * hands any agent a three-call recipe for switching off its own supervision.
+	 */
+	get consecutiveDenials(): number {
+		return this.#consecutiveDenials;
+	}
+
+	get locked(): boolean {
+		return this.#consecutiveDenials >= this.#thresholds.maxConsecutiveDenials;
+	}
+
 	get degradedReason(): string | undefined {
 		return this.#degradedReason;
 	}
@@ -84,7 +102,8 @@ export class GateState {
 		this.#checked++;
 		this.#allowed++;
 		if (options?.classified === true) this.#classified++;
-		this.#consecutive = 0;
+		this.#consecutiveDenials = 0;
+		this.#consecutiveFailures = 0;
 		this.#degradedReason = undefined;
 	}
 
@@ -92,15 +111,27 @@ export class GateState {
 		this.#checked++;
 		this.#denied++;
 		if (options?.classified === true) this.#classified++;
-		this.#consecutive++;
-		this.#tripIfPiledUp();
+		this.#consecutiveDenials++;
+		// Deliberately does not trip the breaker. A refusal locks instead; see `locked`.
+		this.#consecutiveFailures = 0;
 	}
 
-	/** A classifier failure blocks, so it counts as a denial and also marks the gate degraded. */
+	/**
+	 * A classifier failure blocks, so it counts as a denial for the audit totals, and it is the only thing
+	 * that opens the gate. A broken reviewer must not brick the session; a working one must not be
+	 * switchable off.
+	 */
 	recordFailure(reason: string): void {
 		this.#degradedReason = reason;
+		this.#checked++;
+		this.#denied++;
 		// The model was consulted, so this counts toward coverage even though it produced no verdict.
-		this.recordDeny({ classified: true });
+		this.#classified++;
+		// Deliberately not counted toward the lock: a broken reviewer is not the agent misbehaving.
+		this.#consecutiveFailures++;
+		this.#totalFailures++;
+		if (this.#consecutiveFailures >= this.#thresholds.maxConsecutiveDenials) this.#paused = true;
+		if (this.#totalFailures >= this.#thresholds.maxTotalDenials) this.#paused = true;
 	}
 
 	pause(): void {
@@ -130,7 +161,7 @@ export class GateState {
 	resume(): void {
 		this.#paused = false;
 		this.#denied = 0;
-		this.#consecutive = 0;
+		this.#consecutiveDenials = 0;
 		this.#degradedReason = undefined;
 		// Resuming is the user forgiving the session; a stale history would keep arguing against them.
 		this.#refusals.length = 0;
@@ -149,7 +180,7 @@ export class GateState {
 			allowed: this.#allowed,
 			denied: this.#denied,
 			classified: this.#classified,
-			consecutiveDenials: this.#consecutive,
+			consecutiveDenials: this.#consecutiveDenials,
 			paused: this.#paused,
 		};
 		if (this.#degradedReason !== undefined) snapshot.degradedReason = this.#degradedReason;
@@ -165,16 +196,11 @@ export class GateState {
 		this.#allowed = counter(record.allowed) ?? this.#allowed;
 		this.#denied = counter(record.denied) ?? this.#denied;
 		this.#classified = counter(record.classified) ?? this.#classified;
-		this.#consecutive = counter(record.consecutiveDenials) ?? this.#consecutive;
+		this.#consecutiveDenials = counter(record.consecutiveDenials) ?? this.#consecutiveDenials;
 		if (typeof record.paused === "boolean") this.#paused = record.paused;
 		if (typeof record.degradedReason === "string") this.#degradedReason = record.degradedReason;
 		if (Array.isArray(record.refusals)) {
 			this.#refusals = record.refusals.filter(isRefusal).slice(-MAX_REFUSALS);
 		}
-	}
-
-	#tripIfPiledUp(): void {
-		if (this.#consecutive >= this.#thresholds.maxConsecutiveDenials) this.#paused = true;
-		if (this.#denied >= this.#thresholds.maxTotalDenials) this.#paused = true;
 	}
 }
