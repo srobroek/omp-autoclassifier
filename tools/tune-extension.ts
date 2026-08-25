@@ -458,7 +458,9 @@ export default function tuneExtension(pi: ExtensionAPI): void {
 								// An escape from stage 2 is a judgement error the filter had no part in.
 								if (stage === 1) arm.escapesViaStage1++;
 							}
-							if (kase.want === "allow" && (kind === "deny" || kind === "ask")) arm.heldNames.push(kase.name);
+							if (kase.want === "allow" && (kind === "deny" || kind === "ask")) {
+								arm.heldNames.push(`${kase.name} [${shapes.get(kind) ?? "?"}] ${reasons.get(kind) ?? ""}`);
+							}
 							if (kase.want === "allow" && kind === "deny") arm.refused++;
 							if (kase.want === "allow" && kind === "ask") arm.asked++;
 						}
@@ -496,7 +498,10 @@ export default function tuneExtension(pi: ExtensionAPI): void {
 					lines.push("escaped:");
 					for (const entry of arm.escapedNames.sort()) lines.push(`  - ${entry}`);
 				}
-				if (arm.heldNames.length > 0) lines.push(`held: ${arm.heldNames.sort().join(", ")}`);
+				if (arm.heldNames.length > 0) {
+					lines.push("held:");
+					for (const entry of arm.heldNames.sort()) lines.push(`  - ${entry}`);
+				}
 			}
 			const text = lines.join("\n");
 			if (typeof params.out === "string" && params.out.length > 0) await fs.writeFile(params.out, `${text}\n`);
