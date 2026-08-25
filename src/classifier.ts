@@ -37,6 +37,18 @@ export interface CompletionOptions {
 	 * and therefore hid them.
 	 */
 	temperature?: number;
+	/** Reasoning effort, where the provider offers levels. Codex reviews at `medium`. */
+	reasoning?: "minimal" | "low" | "medium" | "high";
+	/** Drop the human-readable thinking summary. Codex sets `default_reasoning_summary: "none"`. */
+	hideThinkingSummary?: boolean;
+	/** Response detail. Codex ships its reviewer at `low`. */
+	textVerbosity?: "low" | "medium" | "high";
+	/**
+	 * Prompt caching. The lever both vendors instrument: Claude Code records
+	 * `classifierCacheReadInputTokens` and `classifierCacheCreationInputTokens` per call, so the classifier
+	 * system prompt is cached rather than re-sent. Ours is about ten thousand characters.
+	 */
+	cacheRetention?: "none" | "short" | "long";
 }
 
 export interface CompletionContext {
@@ -88,6 +100,16 @@ export interface ClassifyOptions {
 	stage2TimeoutMs: number;
 	/** Ask for a safer command to suggest back to the agent. Costs tokens, so it is opt-in. */
 	suggestAlternative?: boolean;
+	/**
+	 * Provider knobs merged into both stage requests, overriding the defaults this module sets.
+	 *
+	 * Exists because the right values are a measurement, not a guess, and the first guesses were wrong in
+	 * both directions: `disableReasoning` looked set for months while landing on an options type that has no
+	 * such field, and once it arrived it doubled one model's latency rather than cutting it. Neither
+	 * reference implementation disables reasoning either — Codex reviews at `reasoning_level: medium` with
+	 * summaries off. So the sweep drives these from outside instead of the module deciding alone.
+	 */
+	providerOptions?: Partial<CompletionOptions>;
 }
 
 export type Risk = "low" | "medium" | "high";
@@ -460,6 +482,7 @@ async function callStage(
 	userText: string,
 	maxTokens: number,
 	timeoutMs: number,
+	overrides: Partial<CompletionOptions> = {},
 ): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
 	const key = `${model.provider}/${model.id}`;
 	const context = { systemPrompt, messages: [{ role: "user" as const, content: [{ type: "text" as const, text: userText }] }] };
@@ -480,7 +503,13 @@ async function callStage(
 				signal: AbortSignal.timeout(timeoutMs),
 				maxTokens,
 				disableReasoning: true,
+				// `hideThinkingSummary` and `textVerbosity: "low"` are deliberately NOT set here. Both are plausible
+				// output-shrinking levers, Codex ships its reviewer with both, and neither has been measured on this
+				// gate. The last option shipped on plausibility alone was `completeSimple`, which doubled one model's
+				// latency instead of cutting it. Drive them through `providerOptions` and promote on numbers.
 				...(withTemperature ? { temperature: 0 } : {}),
+				// Last, so a sweep can overturn any default above, including the two just set.
+				...overrides,
 			});
 			const failure = providerFailure(result);
 			if (failure === undefined) return { ok: true, text: replyText(result) };
@@ -547,6 +576,7 @@ export async function classify(
 		evidence.userText,
 		STAGE1_MAX_TOKENS,
 		options.stage1TimeoutMs,
+		options.providerOptions,
 	);
 	if (!filter.ok) return { kind: "failure", reason: `classifier filter stage failed: ${filter.reason}` };
 	// Only a bare `0` short-circuits. Anything else, including an unparseable reply, escalates: the
@@ -567,6 +597,7 @@ export async function classify(
 			evidence.userText,
 			STAGE2_MAX_TOKENS,
 			options.stage2TimeoutMs,
+			options.providerOptions,
 		);
 		if (!reply.ok) return { kind: "failure", reason: `classifier review stage failed: ${reply.reason}` };
 		const verdict = parseVerdict(reply.text);

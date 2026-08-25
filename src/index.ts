@@ -45,7 +45,11 @@ import { describeCandidate, rankCandidates, SKIP_LABEL, type WizardModel } from 
 let completion: Promise<CompletionFn> | undefined;
 
 function loadCompletion(): Promise<CompletionFn> {
-	completion ??= import("@oh-my-pi/pi-ai").then(module => module.complete as unknown as CompletionFn);
+	// `completeSimple`, not `complete`. The reasoning controls live on `SimpleStreamOptions`, and `complete`
+	// takes `StreamOptions`, which carries no `disableReasoning` field at all. Our own cast to `CompletionFn`
+	// hid the mismatch, so the flag was accepted here and dropped before the provider: every verdict came
+	// from a model free to think first, on a gate whose whole point is a fast answer.
+	completion ??= import("@oh-my-pi/pi-ai").then(module => module.completeSimple as unknown as CompletionFn);
 	return completion;
 }
 

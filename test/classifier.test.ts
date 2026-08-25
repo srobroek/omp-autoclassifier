@@ -7,6 +7,8 @@ interface Call {
 	text: string;
 	maxTokens: number | undefined;
 	temperature: number | undefined;
+	hideThinkingSummary: boolean | undefined;
+	textVerbosity: string | undefined;
 }
 
 /** A queued reply: plain text, a thrown error, or a provider-level outcome that may also carry text. */
@@ -23,6 +25,8 @@ function fakeCompletion(replies: Reply[]) {
 			text,
 			maxTokens: options?.maxTokens,
 			temperature: options?.temperature,
+			hideThinkingSummary: options?.hideThinkingSummary,
+			textVerbosity: options?.textVerbosity,
 		});
 		const reply = replies[calls.length - 1];
 		if (reply instanceof Error) throw reply;
@@ -213,6 +217,36 @@ describe("stage one", () => {
 		const result = await classify(deps({ complete: fake.fn }), evidence, timeouts);
 		expect(result.kind).toBe("failure");
 		expect(fake.calls.length).toBe(1);
+	});
+
+	/**
+	 * The override path, not a default. `hideThinkingSummary` and `textVerbosity` are plausible
+	 * output-shrinking levers that Codex ships on its own reviewer, and neither is measured here yet, so the
+	 * gate must be able to carry them without shipping them.
+	 *
+	 * Pinned because a request option silently failed once already: `disableReasoning` sat on an options type
+	 * without that field and never reached a provider, and no test noticed.
+	 */
+	test("provider overrides reach every stage", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","risk":"low","reason":"ok"}']);
+		await classify(deps({ complete: fake.fn }), evidence, {
+			...timeouts,
+			providerOptions: { hideThinkingSummary: true, textVerbosity: "low" },
+		});
+		expect(fake.calls.length).toBe(2);
+		for (const call of fake.calls) {
+			expect(call.hideThinkingSummary).toBe(true);
+			expect(call.textVerbosity).toBe("low");
+		}
+	});
+
+	test("neither output setting ships as a default", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","risk":"low","reason":"ok"}']);
+		await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		for (const call of fake.calls) {
+			expect(call.hideThinkingSummary).toBeUndefined();
+			expect(call.textVerbosity).toBeUndefined();
+		}
 	});
 
 	test("the filter stage asks for at least the provider minimum", async () => {
