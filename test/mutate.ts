@@ -705,9 +705,9 @@ const classifierMutations: Mutation[] = [
 	},
 	{
 		name: "the policy prose is dropped from the reasoning stage",
-		from: "\tconst stage2System = [...STAGE2_SYSTEM, ...evidence.systemPrompt, ...schema];",
-		to: "\tconst stage2System = [...evidence.systemPrompt];",
-		expect: "states the policy it applies",
+		from: "\tconst stage2System = [...STAGE2_SYSTEM, ...steering.stage2, ...evidence.systemPrompt, ...(options.extraStage2 ?? []), ...schema];",
+		to: "\tconst stage2System = [...steering.stage2, ...evidence.systemPrompt, ...(options.extraStage2 ?? []), ...schema];",
+		expect: "a chained command is judged on every link",
 	},
 ];
 
@@ -1450,6 +1450,33 @@ const commandMutations: Mutation[] = [
 	},
 ];
 
+const steeringMutations: Mutation[] = [
+	{
+		name: "every entry applies regardless of the model",
+		from: "\t\tif (!entry.pattern.test(modelId)) continue;",
+		to: "\t\tif (false) continue;",
+		expect: "a non-matching entry never contributes",
+	},
+	{
+		name: "a global pattern is no longer reset, so the same model matches then misses",
+		from: "\t\tentry.pattern.lastIndex = 0;",
+		to: "",
+		expect: "answers the same way every time",
+	},
+	{
+		name: "filter lines are delivered to the review stage",
+		from: "\t\tif (entry.stage1 !== undefined) stage1.push(...entry.stage1);",
+		to: "\t\tif (entry.stage1 !== undefined) stage2.push(...entry.stage1);",
+		expect: "land on the stage they were written for",
+	},
+	{
+		name: "an unlisted model inherits the whole table",
+		from: "\tconst stage1: string[] = [];",
+		to: "\tconst stage1: string[] = table.flatMap(entry => [...(entry.stage1 ?? [])]);",
+		expect: "a model outside the table gets nothing",
+	},
+];
+
 const groups: Group[] = [
 	{ target: "src/rules.ts", testFile: "test/rules.test.ts", mutations: rulesMutations },
 	{ target: "src/defaults.ts", testFile: "test/rules.test.ts", mutations: defaultsMutations },
@@ -1463,6 +1490,7 @@ const groups: Group[] = [
 	{ target: "src/log.ts", testFile: "test/log.test.ts", mutations: logMutations },
 	{ target: "src/wizard.ts", testFile: "test/wizard.test.ts", mutations: wizardMutations },
 	{ target: "src/command.ts", testFile: "test/command.test.ts", mutations: commandMutations },
+	{ target: "src/steering.ts", testFile: "test/steering.test.ts", mutations: steeringMutations },
 ];
 
 let gaps = 0;

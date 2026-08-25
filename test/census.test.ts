@@ -20,7 +20,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 /** Raise this with the commit that adds tests. Never lower it to make a red suite green. */
-const FLOOR = 437;
+const FLOOR = 459;
 
 const DIRECTORY = path.dirname(import.meta.path);
 /** Excluded from its own census, so adding a check here does not inflate the number it guards. */

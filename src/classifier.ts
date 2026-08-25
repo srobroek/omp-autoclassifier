@@ -14,6 +14,7 @@
  * the runtime import of `@oh-my-pi/pi-ai` stays at the extension boundary where the host's specifier
  * shim resolves it against the bundled copy.
  */
+import { MODEL_STEERING, steeringFor, type ModelSteering } from "./steering";
 import { buildEvidence, type EvidenceRequest } from "./evidence";
 
 /** The slice of `@oh-my-pi/pi-ai`'s `Model` this module needs. */
@@ -100,6 +101,31 @@ export interface ClassifyOptions {
 	stage2TimeoutMs: number;
 	/** Ask for a safer command to suggest back to the agent. Costs tokens, so it is opt-in. */
 	suggestAlternative?: boolean;
+	/**
+	 * Extra lines for the filter stage only.
+	 *
+	 * Separate from `extraStage2` because the stages ask different questions under different budgets, and a
+	 * clause that helps one is dead weight or harm in the other. The filter has 16 tokens and answers one
+	 * character, so policy prose cannot be applied there, only pattern-matched against. `test/classifier`
+	 * already pins the separation from the other side: every stage-2 policy phrase is asserted absent from
+	 * the filter prompt.
+	 *
+	 * Measured: injecting the same wording into both stages through the `environment` prose moved luna's
+	 * clearance from 22 of 130 to 15 while escapes stayed inside the noise floor. Pure cost, no benefit,
+	 * and it made the review-stage effect unreadable.
+	 */
+	/** Overrides the shipped per-model table. A measurement seam; production passes nothing. */
+	steering?: readonly ModelSteering[];
+	extraStage1?: readonly string[];
+	/**
+	 * Extra policy lines for the review stage only, landing after the shared policy and before the schema
+	 * so they sit next to the decision rule the model reads last.
+	 *
+	 * Distinct from the `environment` prose, which reaches both stages through `evidence.systemPrompt`.
+	 * That made a hardening experiment unreadable: tightening wording aimed at the review also changed how
+	 * often the one-token filter cleared a call, so the two effects arrived mixed together.
+	 */
+	extraStage2?: readonly string[];
 	/**
 	 * Provider knobs merged into both stage requests, overriding the defaults this module sets.
 	 *
@@ -567,12 +593,15 @@ export async function classify(
 	if (!auth.ok) return { kind: "failure", reason: `classifier credentials unavailable: ${auth.error}` };
 
 	const evidence = buildEvidence(request);
+	// generic steering -> per-model additions -> rules for steering. The model layer sits between the
+	// shared policy and the user's own prose so a clause for one model never reaches another.
+	const steering = steeringFor(model.id, options.steering ?? MODEL_STEERING);
 
 	const filter = await callStage(
 		deps,
 		model,
 		auth,
-		[...STAGE1_SYSTEM, ...evidence.systemPrompt],
+		[...STAGE1_SYSTEM, ...steering.stage1, ...evidence.systemPrompt, ...(options.extraStage1 ?? [])],
 		evidence.userText,
 		STAGE1_MAX_TOKENS,
 		options.stage1TimeoutMs,
@@ -586,7 +615,7 @@ export async function classify(
 	}
 
 	const schema = options.suggestAlternative === true ? [SCHEMA_LINE, ALTERNATIVE_LINE] : [SCHEMA_LINE];
-	const stage2System = [...STAGE2_SYSTEM, ...evidence.systemPrompt, ...schema];
+	const stage2System = [...STAGE2_SYSTEM, ...steering.stage2, ...evidence.systemPrompt, ...(options.extraStage2 ?? []), ...schema];
 	for (const attempt of [0, 1]) {
 		const system = attempt === 0 ? stage2System : [...stage2System, STAGE2_RETRY_SUFFIX];
 		const reply = await callStage(

@@ -472,6 +472,75 @@ describe("stage two", () => {
 		await classify(deps({ complete: fake.fn }), evidence, timeouts);
 		expect(fake.calls[1]?.maxTokens).toBeGreaterThan(100);
 	});
+
+	/**
+	 * A hardening clause has to reach the review and nothing else. Injecting the same wording through the
+	 * `environment` prose reached both stages, which moved how often the filter cleared a call and left the
+	 * experiment unreadable: two effects, one number.
+	 */
+	test("extra review policy reaches the review stage only", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","reason":"x"}']);
+		await classify(deps({ complete: fake.fn }), evidence, { ...timeouts, extraStage2: ["ZZQQ marker line."] });
+		expect(fake.calls[0]?.systemPrompt.join("\n")).not.toContain("ZZQQ");
+		expect(fake.calls[1]?.systemPrompt.join("\n")).toContain("ZZQQ");
+	});
+
+	test("extra review policy lands before the schema, so the answer format is read last", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","reason":"x"}']);
+		await classify(deps({ complete: fake.fn }), evidence, { ...timeouts, extraStage2: ["ZZQQ marker line."] });
+		const prompt = fake.calls[1]?.systemPrompt.join("\n") ?? "";
+		expect(prompt.indexOf("ZZQQ")).toBeLessThan(prompt.indexOf("Answer with JSON only"));
+	});
+
+	/** The mirror of the review-stage hook: a filter clause must not reach the review either. */
+	test("extra filter policy reaches the filter stage only", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","reason":"x"}']);
+		await classify(deps({ complete: fake.fn }), evidence, { ...timeouts, extraStage1: ["YYWW marker line."] });
+		expect(fake.calls[0]?.systemPrompt.join("\n")).toContain("YYWW");
+		expect(fake.calls[1]?.systemPrompt.join("\n")).not.toContain("YYWW");
+	});
+
+	test("the two stage hooks stay independent when both are given", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","reason":"x"}']);
+		await classify(deps({ complete: fake.fn }), evidence, {
+			...timeouts,
+			extraStage1: ["YYWW filter only."],
+			extraStage2: ["ZZQQ review only."],
+		});
+		const filter = fake.calls[0]?.systemPrompt.join("\n") ?? "";
+		const review = fake.calls[1]?.systemPrompt.join("\n") ?? "";
+		expect(filter).toContain("YYWW");
+		expect(filter).not.toContain("ZZQQ");
+		expect(review).toContain("ZZQQ");
+		expect(review).not.toContain("YYWW");
+	});
+
+	/**
+	 * The three layers, in order: generic steering, then the per-model addition, then the user's rules.
+	 * A model clause has to sit after the shared policy so it can correct it, and before the rules so a
+	 * user's own prose still has the last word.
+	 */
+	test("per-model steering lands between the shared policy and the user rules", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","reason":"x"}']);
+		await classify(
+			deps({ complete: fake.fn }),
+			{ ...evidence, environment: ["RULESLINE from config."] },
+			{ ...timeouts, steering: [{ pattern: /cheap-1/, stage2: ["MODELLINE for this model."] }] },
+		);
+		const review = fake.calls[1]?.systemPrompt.join("\n") ?? "";
+		expect(review).toContain("MODELLINE");
+		expect(review.indexOf("MODELLINE")).toBeLessThan(review.indexOf("RULESLINE"));
+		expect(review.indexOf("RULESLINE")).toBeLessThan(review.indexOf("Answer with JSON only"));
+	});
+
+	test("per-model steering for another model never reaches this one", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","reason":"x"}']);
+		await classify(deps({ complete: fake.fn }), evidence, {
+			...timeouts,
+			steering: [{ pattern: /some-other-model/, stage2: ["MODELLINE."] }],
+		});
+		expect(fake.calls[1]?.systemPrompt.join("\n")).not.toContain("MODELLINE");
+	});
 });
 
 /**
