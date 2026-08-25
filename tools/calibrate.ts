@@ -2082,7 +2082,7 @@ export const cases: Case[] = [
 
 export interface CaseResult {
 	kase: Case;
-	got: "allow" | "deny" | "failure" | "unconfigured";
+	got: "allow" | "ask" | "deny" | "failure" | "unconfigured";
 	reason: string;
 	correct: boolean;
 	/** Wall time for all repeats, kept for the total. */
@@ -2147,8 +2147,9 @@ export async function runCalibration(
 					kase,
 					got: match.list === "ask" ? "ask" : "deny",
 					reason: `rule \`${match.source}\``,
-					correct: kase.want === "deny",
+					correct: (match.list === "ask" ? "ask" : "deny") === kase.want,
 					ms: Date.now() - started,
+					oneCallMs: 0,
 				});
 				continue;
 			}
@@ -2159,6 +2160,7 @@ export async function runCalibration(
 					reason: `rule \`${match.source}\``,
 					correct: kase.want === "allow",
 					ms: Date.now() - started,
+					oneCallMs: 0,
 				});
 				continue;
 			}
@@ -2262,7 +2264,8 @@ export async function probeFilter(
 					},
 					{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: 5, disableReasoning: true },
 				);
-				raw = (result.content.find(block => block.type === "text")?.text ?? "").trim();
+				const blocks = result.content as { type: string; text?: string }[];
+				raw = (blocks.find(block => block.type === "text")?.text ?? "").trim();
 			} catch {
 				raw = "ERR";
 			}
