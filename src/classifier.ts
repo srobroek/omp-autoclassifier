@@ -39,7 +39,8 @@ export interface CompletionOptions {
 	 */
 	temperature?: number;
 	/** Reasoning effort, where the provider offers levels. Codex reviews at `medium`. */
-	reasoning?: "minimal" | "low" | "medium" | "high";
+	/** Matches pi-ai's `Effort`, which reaches past `high`. Ours stopped at `high` and could not ask for more. */
+	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	/** Drop the human-readable thinking summary. Codex sets `default_reasoning_summary: "none"`. */
 	hideThinkingSummary?: boolean;
 	/** Response detail. Codex ships its reviewer at `low`. */

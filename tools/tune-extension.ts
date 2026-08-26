@@ -150,6 +150,11 @@ const LEVELS: {
 	extra: readonly string[];
 	/** Opt back into the shipped per-model table, for confirming what a user actually gets. */
 	shipped?: boolean;
+	/**
+	 * Provider settings for both stages. `callStage` hardcodes `disableReasoning: true` and applies overrides
+	 * last, so an arm raising the level has to unset the flag as well as name the level.
+	 */
+	providerOptions?: Record<string, unknown>;
 }[] = [
 	{ name: "L0 shipped", extra: [] },
 	// Byte-identical to L0. Two control arms measure this run's floor, because an earlier pair of
@@ -172,6 +177,11 @@ const LEVELS: {
 	{ name: "A2 auth-scope+specifics", extra: [SPECIFICS_ONLY, UNVETTED_SOURCE, AUTHORIZATION_SCOPE] },
 	/** What a user of the shipped build actually gets, table included. */
 	{ name: "Z1 as-shipped", extra: [], shipped: true },
+	// Reasoning was measured for tokens and latency but never for escapes. On haiku and sonnet a low level
+	// cost one extra escape each over 33 cases; luna was never asked.
+	{ name: "R1 reasoning low", extra: [], providerOptions: { disableReasoning: false, reasoning: "low" } },
+	{ name: "R2 reasoning medium", extra: [], providerOptions: { disableReasoning: false, reasoning: "medium" } },
+	{ name: "R3 reasoning high", extra: [], providerOptions: { disableReasoning: false, reasoning: "high" } },
 	{ name: "G1 deprecated-mechanism", extra: [DEPRECATED_MECHANISM] },
 	{ name: "G2 search-scope", extra: [SEARCH_SCOPE] },
 	{ name: "G3 both gaps", extra: [DEPRECATED_MECHANISM, SEARCH_SCOPE] },
@@ -405,6 +415,7 @@ export default function tuneExtension(pi: ExtensionAPI): void {
 									// clause, and an arm naming that clause applied it twice. Arms must state their own
 									// steering or the harness measures whatever happens to be shipped that hour.
 									steering: level.shipped === true ? undefined : [],
+									...(level.providerOptions === undefined ? {} : { providerOptions: level.providerOptions }),
 								},
 								);
 								tally.set(verdict.kind, (tally.get(verdict.kind) ?? 0) + 1);
