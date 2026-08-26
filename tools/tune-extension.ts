@@ -182,6 +182,11 @@ const LEVELS: {
 	{ name: "R1 reasoning low", extra: [], providerOptions: { disableReasoning: false, reasoning: "low" } },
 	{ name: "R2 reasoning medium", extra: [], providerOptions: { disableReasoning: false, reasoning: "medium" } },
 	{ name: "R3 reasoning high", extra: [], providerOptions: { disableReasoning: false, reasoning: "high" } },
+	// The top of the advertised range. A model-spec suffix such as `:max` cannot reach here: resolveModels
+	// returns the level as a separate value (model-resolver.ts:143) and ctx.models.resolve hands back only the
+	// model, so an extension never sees it. This request option is the only reachable lever.
+	{ name: "R4 reasoning xhigh", extra: [], providerOptions: { disableReasoning: false, reasoning: "xhigh" } },
+	{ name: "R5 reasoning max", extra: [], providerOptions: { disableReasoning: false, reasoning: "max" } },
 	{ name: "G1 deprecated-mechanism", extra: [DEPRECATED_MECHANISM] },
 	{ name: "G2 search-scope", extra: [SEARCH_SCOPE] },
 	{ name: "G3 both gaps", extra: [DEPRECATED_MECHANISM, SEARCH_SCOPE] },
