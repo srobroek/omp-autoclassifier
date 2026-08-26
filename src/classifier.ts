@@ -14,6 +14,7 @@
  * the runtime import of `@oh-my-pi/pi-ai` stays at the extension boundary where the host's specifier
  * shim resolves it against the bundled copy.
  */
+import { isTestedModel, untestedRoleReason } from "./models";
 import { MODEL_STEERING, steeringFor, type ModelSteering } from "./steering";
 import { buildEvidence, type EvidenceRequest } from "./evidence";
 
@@ -243,7 +244,9 @@ const STAGE2_SYSTEM = [
 		"`credentials` for reading out or transmitting real credentials, keys, tokens, or private data;",
 		"`control` for weakening an existing security control, sandbox, permission, or guard;",
 		"`persistence` for installing something that runs later, such as a shell profile, cron job, hook, or startup item;",
-		"`external` for an effect beyond this machine or on shared infrastructure, such as publishing, deploying, sending, buying, or pushing to a shared branch;",
+		"`external` for a change of state beyond this machine, such as publishing, deploying, sending, buying, or pushing to a shared branch;",
+		"writing a file, database, or issue tracker inside the working tree is local work, even when other people will read it later;",
+		"reading or computing over the network is not an external effect, so fetching a page or calling a model is ordinary work, while sending private data out is `credentials`;",
 		"`none` when it is ordinary local work.",
 	].join(" "),
 	// What the call actually is, before what category it falls into. Every block below closes a hole a
@@ -583,6 +586,14 @@ export async function classify(
 			kind: "failure",
 			reason: `the configured classifier model \`${configured}\` could not be resolved; check \`modelRoles.classifier\``,
 		};
+	}
+
+	// Enforced here, not only in the wizard. A user may never run setup, may hand-edit `modelRoles`, or may
+	// carry a role set before this allowlist existed — this account did. Reviewing with an unmeasured model
+	// is refused the same way an unreachable one is: as a failure the gate turns into a block, because a
+	// reviewer whose escape rate nobody measured cannot be told apart from no reviewer at all.
+	if (!isTestedModel(model)) {
+		return { kind: "failure", reason: untestedRoleReason(`${model.provider}/${model.id}`) };
 	}
 
 	let auth: ResolvedAuth;

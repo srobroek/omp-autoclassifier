@@ -31,7 +31,10 @@ export interface StateSnapshot {
 	 */
 	classified: number;
 	consecutiveDenials: number;
+	/** The user's own bypass: allows every call. */
 	paused: boolean;
+	/** The breaker: repeated classifier failures, so no verdict exists and every call is refused. */
+	degraded: boolean;
 	degradedReason?: string;
 	refusals?: Refusal[];
 }
@@ -64,7 +67,10 @@ export class GateState {
 	#consecutiveDenials = 0;
 	#consecutiveFailures = 0;
 	#totalFailures = 0;
+	/** The user's own bypass, from `/autoclassifier pause`. Allows every call. */
 	#paused = false;
+	/** The breaker: the classifier failed repeatedly, so no verdict exists. Refuses every call. */
+	#degraded = false;
 	#degradedReason: string | undefined;
 	/** Failure classes already announced this session, so a degraded gate notifies once, not per call. */
 	readonly #noticed = new Set<string>();
@@ -76,6 +82,15 @@ export class GateState {
 
 	get paused(): boolean {
 		return this.#paused;
+	}
+
+	/**
+	 * True once the classifier has failed enough times that the gate stopped trusting it. Refuses, where
+	 * {@link paused} allows: a broken reviewer produces no verdict, and treating "no verdict" as consent is
+	 * the failure this flag was split out to prevent.
+	 */
+	get degraded(): boolean {
+		return this.#degraded;
 	}
 
 	/**
@@ -117,9 +132,14 @@ export class GateState {
 	}
 
 	/**
-	 * A classifier failure blocks, so it counts as a denial for the audit totals, and it is the only thing
-	 * that opens the gate. A broken reviewer must not brick the session; a working one must not be
-	 * switchable off.
+	 * A classifier failure blocks, so it counts as a denial for the audit totals.
+	 *
+	 * A run of them sets `degraded`, which is distinct from `paused` on purpose. `paused` is the user's own
+	 * bypass and allows; `degraded` means no verdict exists and refuses. They shared one flag until a review
+	 * caught it, and the sharing meant a provider rejecting a fixable request field switched the gate off.
+	 *
+	 * Not counted toward the lock: a broken reviewer is not the agent misbehaving, and the lock's message
+	 * blames the agent.
 	 */
 	recordFailure(reason: string): void {
 		this.#degradedReason = reason;
@@ -127,11 +147,10 @@ export class GateState {
 		this.#denied++;
 		// The model was consulted, so this counts toward coverage even though it produced no verdict.
 		this.#classified++;
-		// Deliberately not counted toward the lock: a broken reviewer is not the agent misbehaving.
 		this.#consecutiveFailures++;
 		this.#totalFailures++;
-		if (this.#consecutiveFailures >= this.#thresholds.maxConsecutiveDenials) this.#paused = true;
-		if (this.#totalFailures >= this.#thresholds.maxTotalDenials) this.#paused = true;
+		if (this.#consecutiveFailures >= this.#thresholds.maxConsecutiveDenials) this.#degraded = true;
+		if (this.#totalFailures >= this.#thresholds.maxTotalDenials) this.#degraded = true;
 	}
 
 	pause(): void {
@@ -160,6 +179,12 @@ export class GateState {
 
 	resume(): void {
 		this.#paused = false;
+		// The breaker and its counters clear too, or `/autoclassifier resume` would print success and leave
+		// every call still refused. Resume is the only exit from `degraded`: a blocked call produces no
+		// allow, so nothing else can ever reset the run.
+		this.#degraded = false;
+		this.#consecutiveFailures = 0;
+		this.#totalFailures = 0;
 		this.#denied = 0;
 		this.#consecutiveDenials = 0;
 		this.#degradedReason = undefined;
@@ -182,6 +207,7 @@ export class GateState {
 			classified: this.#classified,
 			consecutiveDenials: this.#consecutiveDenials,
 			paused: this.#paused,
+			degraded: this.#degraded,
 		};
 		if (this.#degradedReason !== undefined) snapshot.degradedReason = this.#degradedReason;
 		if (this.#refusals.length > 0) snapshot.refusals = [...this.#refusals];
@@ -198,6 +224,10 @@ export class GateState {
 		this.#classified = counter(record.classified) ?? this.#classified;
 		this.#consecutiveDenials = counter(record.consecutiveDenials) ?? this.#consecutiveDenials;
 		if (typeof record.paused === "boolean") this.#paused = record.paused;
+		// Persisted with the snapshot because this is per-session state: a branch or a resume of the same
+		// session must not silently re-arm a gate the user paused, nor forget that the classifier is broken.
+		// It never crosses into a different session, which is the leak the `enabled` setting exists for.
+		if (typeof record.degraded === "boolean") this.#degraded = record.degraded;
 		if (typeof record.degradedReason === "string") this.#degradedReason = record.degradedReason;
 		if (Array.isArray(record.refusals)) {
 			this.#refusals = record.refusals.filter(isRefusal).slice(-MAX_REFUSALS);

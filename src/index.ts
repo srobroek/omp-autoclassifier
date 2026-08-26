@@ -39,6 +39,7 @@ import {
 	unregisterSession,
 } from "./registry";
 import { GateState } from "./state";
+import { NoTestedModelError } from "./models";
 import { describeCandidate, rankCandidates, SKIP_LABEL, type WizardModel } from "./wizard";
 
 /** Resolved once per process: the host's own `complete`, via the scope shim. */
@@ -156,21 +157,14 @@ export default function autoclassifier(pi: ExtensionAPI): void {
 			ctx.ui.notify("autoclassifier: no authenticated models are available to act as a classifier.", "error");
 			return;
 		}
-		// `getModelRoles` returns a dictionary whose values may be undefined; the wizard only cares about
-		// roles that actually name a model.
-		const roles: Record<string, string> = {};
-		try {
-			for (const [role, value] of Object.entries(host.settings.getModelRoles())) {
-				if (typeof value === "string" && value.length > 0) roles[role] = value;
-			}
-		} catch {
-			// A settings store that cannot answer just forfeits the "already trusted for cheap work" hint.
+		const ranked = rankCandidates(models as WizardModel[]);
+		// A hard error, not an empty picker. The account holds neither release the matrix measured, so there
+		// is nothing to offer and nothing this gate could review with; saying "pick one" over an empty list
+		// would read as a UI bug rather than a missing prerequisite.
+		if (ranked.length === 0) {
+			ctx.ui.notify(new NoTestedModelError().message, "error");
+			return;
 		}
-		const ranked = rankCandidates(models as WizardModel[], {
-			roles,
-			current: ctx.models.current() as WizardModel | undefined,
-			family: candidate => ctx.models.family(candidate as Model),
-		});
 		const shortlist = ranked.slice(0, 5);
 		const choice = await ctx.ui.select(
 			"Which model should classify tool calls? A small, cheap model is the right pick.",

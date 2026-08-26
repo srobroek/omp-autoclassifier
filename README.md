@@ -105,6 +105,20 @@ Sending both readers the same string served neither: the fielded form is noise i
 leaves an agent guessing which axis refused it. The user's line carries no `next`, because the agent's
 moves are not theirs to take.
 
+`verdictDetail` sets how much of that line the notification carries. The levels run from the call alone to
+the whole payload the agent received.
+
+| Level | Carries |
+| --- | --- |
+| `minimal` | The call and its target. |
+| `normal` | Adds the category and the model's sentence. The line above. |
+| `verbose` | Adds the axes the verdict turned on, and states the injection flag even when nothing was suspected. |
+| `debug` | Adds which stage or rule decided, and reproduces the agent's payload verbatim. |
+
+The setting moves the notification only. The payload above keeps every field at every level, because an
+agent acting on a refusal cannot work from a shorter one. `debug` exists for the opposite case: someone
+auditing a refusal needs the fields the agent got, and rebuilding them from a one-line toast is guesswork.
+
 ### A refused call stays refused
 
 The gate never caches a denial, so authorization you give in chat takes effect at once. The cost: the
@@ -229,6 +243,7 @@ omp plugin config list omp-autoclassifier
 | `activeModes` | `yolo,write,always-ask` | Approval modes the gate runs in |
 | `escalate` | `false` | Prompt instead of blocking, in interactive sessions |
 | `suggestAlternative` | `false` | Ask the review stage for a safer command when it refuses one. Costs tokens on every review. |
+| `verdictDetail` | `normal` | How much of a refusal the notification carries. User-facing only: the agent's payload never varies. |
 | `classifySubagents` | `true` | Classify calls inside spawned subagents |
 | `stage1TimeoutMs` | `4000` | Filter stage timeout |
 | `stage2TimeoutMs` | `10000` | Review stage timeout |

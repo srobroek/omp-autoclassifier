@@ -17,6 +17,32 @@ export interface RuleLists {
 	allow: string[];
 }
 
+/**
+ * How much of a refusal the user sees.
+ *
+ * This governs the notification only. The agent's tool error is fielded and always complete, because an
+ * agent that has to act on a refusal cannot be handed a shorter one — so no level here withholds anything
+ * from it, and the trade is the reader's attention rather than tokens.
+ *
+ * It is an enum manifest setting rather than a wizard question, because omp renders enum plugin settings as
+ * a submenu in the Settings TUI and persists them itself — a wizard would have had to reimplement that and
+ * could not write the value from inside a running extension anyway.
+ *
+ * - `minimal` — the tool and its target. Enough to know the gate fired and on what.
+ * - `normal` — adds the harmful category and the model's own sentence.
+ * - `verbose` — adds the axes a reader would audit: authorization, risk, reversibility, scope, confidence,
+ *   and the injection flag even when nothing was suspected.
+ * - `debug` — adds which stage or rule decided, and the agent's payload verbatim.
+ */
+export type VerdictDetail = "minimal" | "normal" | "verbose" | "debug";
+
+export const VERDICT_DETAIL_LEVELS: readonly VerdictDetail[] = Object.freeze([
+	"minimal",
+	"normal",
+	"verbose",
+	"debug",
+]);
+
 /** Scalars mirrored from the plugin manifest `omp.settings` block. */
 export interface Scalars {
 	enabled: boolean;
@@ -33,6 +59,10 @@ export interface Scalars {
 	logClassifierIo: boolean;
 	/** Ask the classifier to suggest a safer command in its refusal. Costs tokens per review. */
 	suggestAlternative: boolean;
+	/**
+	 * How much of a refusal the notification carries. User-facing only: the agent's payload is unaffected.
+	 */
+	verdictDetail: VerdictDetail;
 }
 
 export interface EvidenceLimits {
@@ -63,6 +93,7 @@ export const SCALAR_DEFAULTS: Readonly<Scalars> = Object.freeze({
 	logDecisions: true,
 	logClassifierIo: false,
 	suggestAlternative: false,
+	verdictDetail: "normal",
 });
 
 export const EVIDENCE_DEFAULTS: Readonly<EvidenceLimits> = Object.freeze({

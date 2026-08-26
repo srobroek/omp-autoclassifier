@@ -19,6 +19,7 @@
  * Everything that is not an explicit allow ends in a block, and a block carries a reason the model
  * reads as a tool error.
  */
+import { announce } from "./announce";
 import type { VerdictCache } from "./cache";
 import type { ClassifyOptions, ClassifyResult, Dimensions } from "./classifier";
 import type { EffectiveConfig } from "./config";
@@ -90,6 +91,8 @@ export type Via =
 	| "hardDeny"
 	| "inactive-mode"
 	| "paused"
+	/** The breaker refused: repeated classifier failures, so no verdict exists. Distinct from `paused`. */
+	| "degraded"
 	| "locked"
 	| "deny"
 	| "allow"
@@ -221,6 +224,34 @@ export async function decide(deps: GateDeps, request: GateRequest): Promise<Gate
 			),
 		};
 	}
+	// Two states, opposite answers, and conflating them was a regression caught in review.
+	//
+	// `degraded` is the breaker: the classifier failed repeatedly, so no verdict exists. That now blocks.
+	// It used to allow, on the reasoning that a broken reviewer must not brick the session, and the trade
+	// was rejected once it became concrete — a provider rejecting a fixable request field would silently
+	// switch supervision off in exactly the window nobody is watching.
+	//
+	// `paused` is the user's own bypass, set by `/autoclassifier pause`. It still allows, because a person
+	// who switched the gate off for this session has authorized every call in it by definition. Making
+	// that block too would have turned the documented escape hatch into a wall.
+	if (deps.state.degraded) {
+		return {
+			action: "block",
+			via: "degraded",
+			reason: JSON.stringify(
+				{
+					autoclassifier: "blocked",
+					tool: toolName,
+					via: "gate degraded",
+					why: `The classifier failed repeatedly, so no verdict is available: ${deps.state.snapshot().degradedReason ?? "reason unrecorded"}`,
+					next: "Tell the user the gate is degraded and what you were trying to do. They can run `/autoclassifier resume` once the classifier works.",
+					notThis: "Retrying. A degraded gate refuses every call until it is resumed.",
+				},
+				null,
+				2,
+			),
+		};
+	}
 	if (deps.state.paused) return { action: "allow", via: "paused" };
 
 	if (match?.list === "deny") {
@@ -323,7 +354,19 @@ export async function decide(deps: GateDeps, request: GateRequest): Promise<Gate
 		// Prose, not the agent's JSON: this path builds its own reason rather than going through `finish`,
 		// and sending the payload to a toast put a formatted object on the user's screen.
 		if (hasUI) {
-			deps.notify(announceVerdict(toolName, input, "", `the risk classifier is unreachable (${verdict.reason})`), "error");
+			// No dimensions exist on this path: the classifier never answered. Empty axes render as
+			// `unstated` rather than as blank labels, and `debug` still reproduces the agent's payload.
+			deps.notify(
+				announceVerdict(
+					cfg,
+					toolName,
+					input,
+					{},
+					`the risk classifier is unreachable (${verdict.reason})`,
+					decision.reason,
+				),
+				"error",
+			);
 		}
 		emit(deps, request, decision, { reason: verdict.reason });
 		return decision;
@@ -418,19 +461,40 @@ function explainVerdict(
 }
 
 /**
- * The same refusal for a person, in one line.
+ * The same refusal for a person, at the detail level they asked for.
  *
- * A notification arrives while they are reading something else, so it carries the call, the target, and
- * why — and none of the agent's next moves, which are not theirs to take. Sending both readers the same
- * string served neither: the fielded form is noise in a toast, and a one-liner leaves an agent guessing.
+ * A notification arrives while they are reading something else, so by default it carries the call, the
+ * target and why — and none of the agent's next moves, which are not theirs to take. Sending both readers
+ * the same string served neither: the fielded form is noise in a toast, and a one-liner leaves an agent
+ * guessing.
+ *
+ * The level governs this text only. `explainVerdict` above always carries every field, because the agent
+ * has to act on them and a user's display preference must never decide what the reviewer tells the thing
+ * it is reviewing.
  */
-function announceVerdict(toolName: string, input: unknown, category: string, reason: string): string {
-	const target = describeTarget(primaryArgument(toolName, input));
-	const what = target === undefined ? `\`${toolName}\`` : `\`${toolName}\` on ${target}`;
-	// A rule block carries no category at all, which is a third empty case beside the model's two.
-	const unnamed = category === "" || category === "none" || category === "unstated";
-	const named = unnamed ? "" : ` (${category})`;
-	return `autoclassifier blocked ${what}${named}: ${reason}`.replace(/\s+/g, " ").trim();
+function announceVerdict(
+	cfg: EffectiveConfig,
+	toolName: string,
+	input: unknown,
+	extra: Partial<DecisionRecord>,
+	reason: string,
+	agentPayload?: string,
+): string {
+	return announce(cfg.verdictDetail, {
+		toolName,
+		target: describeTarget(primaryArgument(toolName, input)),
+		reason,
+		category: extra.category ?? "",
+		authorization: extra.authorization ?? "",
+		risk: extra.risk ?? "",
+		reversibility: extra.reversibility ?? "",
+		scope: extra.scope ?? "",
+		confidence: extra.confidence ?? "",
+		injectionSuspected: extra.injectionSuspected ?? false,
+		...(extra.stage === undefined ? {} : { stage: extra.stage }),
+		...(extra.rule === undefined ? {} : { rule: extra.rule }),
+		...(agentPayload === undefined ? {} : { agentPayload }),
+	});
 }
 
 /**
@@ -558,7 +622,18 @@ function finish(
 	if (decision.action === "block" && request.hasUI) {
 		// Derived here rather than threaded through every block site: this is the one place that already
 		// holds both the request and the record fields, and the only place that notifies.
-		deps.notify(announceVerdict(request.toolName, request.input, extra.category ?? "", why(decision, extra)), "warning");
+		// `decision.reason` is the agent's own payload, reproduced verbatim at `debug` only.
+		deps.notify(
+			announceVerdict(
+				deps.config(),
+				request.toolName,
+				request.input,
+				extra,
+				why(decision, extra),
+				decision.reason,
+			),
+			"warning",
+		);
 		// The refusal that locks the session is the one message the user cannot afford to miss: from here on
 		// the agent is stopped and only they can restart it. Announced once, at the transition, because the
 		// locked calls that follow are silent by design — a locked agent hammering tools must not spam.

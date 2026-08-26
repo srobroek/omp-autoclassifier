@@ -118,6 +118,28 @@ describe("validation", () => {
 		expect(cfg.warnings.join(" ")).toContain("stage1TimeoutMs");
 	});
 
+	/**
+	 * omp validates an enum when its own Settings UI writes one. Nothing reaching this resolver went through
+	 * that check, so a misspelled level in a hand-edited file would otherwise pass the type check and read as
+	 * a level.
+	 */
+	test("an unknown enum value is ignored and reported", () => {
+		writeLockfile({ verdictDetail: "verbse" });
+		const cfg = store().get();
+		expect(cfg.verdictDetail).toBe(SCALAR_DEFAULTS.verdictDetail);
+		expect(cfg.origins.verdictDetail).toBe("default");
+		expect(cfg.warnings.join(" ")).toContain("verbse");
+	});
+
+	test("a known enum value is accepted from every store", () => {
+		writeLockfile({ verdictDetail: "minimal" });
+		expect(store().get().verdictDetail).toBe("minimal");
+		fs.writeFileSync(paths.userYaml, "verdictDetail: debug\n");
+		const cfg = store().get();
+		expect(cfg.verdictDetail).toBe("debug");
+		expect(cfg.warnings).toEqual([]);
+	});
+
 	test("an unknown key is reported so a typo is not silently ignored", () => {
 		fs.writeFileSync(paths.userYaml, "escalte: true\n");
 		expect(store().get().warnings.join(" ")).toContain("escalte");

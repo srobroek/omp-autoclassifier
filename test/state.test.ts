@@ -85,34 +85,59 @@ describe("classifier coverage", () => {
 });
 
 /**
- * The breaker exists so a misfiring gate cannot wall off a session indefinitely. Both vendors surveyed
- * pause on a run of refusals rather than trusting the reviewer to recover on its own.
+ * The breaker marks the gate `degraded`: the classifier failed enough times that no verdict is available,
+ * so every call is refused until the user resumes.
+ *
+ * It sets a different flag from `paused` on purpose. `paused` is the user's own bypass and allows; sharing
+ * one flag meant a provider rejecting a fixable request field switched supervision off silently, which is
+ * the opposite of what a fail-closed gate promises.
  */
 describe("circuit breaker", () => {
-	test("a run of consecutive failures pauses the gate", () => {
+	test("a run of consecutive failures degrades the gate", () => {
 		const state = new GateState(thresholds);
 		state.recordFailure("model unreachable");
 		state.recordFailure("model unreachable");
-		expect(state.paused).toBe(false);
+		expect(state.degraded).toBe(false);
 		state.recordFailure("model unreachable");
-		expect(state.paused).toBe(true);
+		expect(state.degraded).toBe(true);
 	});
 
-	test("scattered failures still pause once the session total is reached", () => {
+	/** The breaker must not touch the user's bypass, or resuming would report the wrong state. */
+	test("degrading never sets the user's own pause", () => {
+		const state = new GateState({ maxConsecutiveDenials: 1, maxTotalDenials: 20 });
+		state.recordFailure("down");
+		expect(state.degraded).toBe(true);
+		expect(state.paused).toBe(false);
+	});
+
+	test("scattered failures still degrade once the session total is reached", () => {
 		const state = new GateState({ maxConsecutiveDenials: 100, maxTotalDenials: 3 });
 		for (let i = 0; i < 2; i++) {
 			state.recordFailure("down");
 			state.recordAllow();
 		}
-		expect(state.paused).toBe(false);
+		expect(state.degraded).toBe(false);
 		state.recordFailure("down");
-		expect(state.paused).toBe(true);
+		expect(state.degraded).toBe(true);
 	});
 
-	test("a threshold of one pauses on the first failure", () => {
+	test("a threshold of one degrades on the first failure", () => {
 		const state = new GateState({ maxConsecutiveDenials: 1, maxTotalDenials: 20 });
 		state.recordFailure("down");
-		expect(state.paused).toBe(true);
+		expect(state.degraded).toBe(true);
+	});
+
+	/**
+	 * Resume is the only exit. A degraded gate refuses every call, so no allow can ever arrive to reset the
+	 * run on its own — without this, resuming would report success and change nothing.
+	 */
+	test("resume clears the degraded state and its counters", () => {
+		const state = new GateState({ maxConsecutiveDenials: 1, maxTotalDenials: 20 });
+		state.recordFailure("down");
+		state.resume();
+		expect(state.degraded).toBe(false);
+		state.recordFailure("down");
+		expect(state.degraded).toBe(true);
 	});
 
 	/**
@@ -200,26 +225,28 @@ describe("circuit breaker", () => {
 });
 
 /**
- * The breaker exists so a broken classifier cannot brick a session. It must not double as a way to
- * switch the gate off by persisting.
+ * A failure and a denial are indistinguishable from the agent's side — both block — and that was once the
+ * argument for counting them together. It was wrong, because the right *response* differs: a wall of
+ * failures means the reviewer is broken and no verdict exists, while a wall of denials means the reviewer
+ * is working and is being ignored.
  *
- * Both were counted together at first, on the reasoning that a failure and a denial are indistinguishable
- * from the agent's side. True, and irrelevant: the right *response* differs completely. A wall of failures
- * means the reviewer is broken, so opening the gate is the lesser harm. A wall of denials means the
- * reviewer is working, and opening the gate there rewards persistence and hands any agent a three-call
- * recipe for disabling its own supervision.
+ * Neither opens the gate. Failures used to, and a review of this file caught what that bought: a provider
+ * rejecting one fixable request field would silently stop supervision after three calls. The two states are
+ * now separate flags with opposite answers, and only the user's own `/autoclassifier pause` allows.
  */
 describe("breaker separates a broken reviewer from a working one", () => {
-	test("a run of classifier failures opens the gate", () => {
+	test("a run of classifier failures degrades the gate rather than opening it", () => {
 		const state = new GateState(thresholds);
 		for (const _ of [1, 2, 3]) state.recordFailure("model unreachable");
-		expect(state.paused).toBe(true);
+		expect(state.degraded).toBe(true);
+		expect(state.paused).toBe(false);
 	});
 
 	test("a run of genuine denials never opens the gate", () => {
 		const state = new GateState(thresholds);
 		for (const _ of [1, 2, 3, 4, 5, 6]) state.recordDeny();
 		expect(state.paused).toBe(false);
+		expect(state.degraded).toBe(false);
 	});
 
 	test("a wall of denials is still counted, so it can be reported", () => {
@@ -363,12 +390,27 @@ describe("persistence", () => {
 		expect(restored.degradedReason).toBe("boom");
 	});
 
-	test("a paused gate stays paused after restore", () => {
+	/**
+	 * Both flags survive a branch or a resume of the same session, and they are separate fields because
+	 * they mean opposite things. A resumed session must not silently re-arm a gate the user paused, nor
+	 * forget that the classifier is broken.
+	 */
+	test("a degraded gate stays degraded after restore", () => {
 		const state = new GateState(thresholds);
 		for (let i = 0; i < 3; i++) state.recordFailure("down");
 		const restored = new GateState(thresholds);
 		restored.restore(state.snapshot());
+		expect(restored.degraded).toBe(true);
+		expect(restored.paused).toBe(false);
+	});
+
+	test("the user's own pause stays paused after restore", () => {
+		const state = new GateState(thresholds);
+		state.pause();
+		const restored = new GateState(thresholds);
+		restored.restore(state.snapshot());
 		expect(restored.paused).toBe(true);
+		expect(restored.degraded).toBe(false);
 	});
 
 	test("malformed persisted state is ignored rather than throwing", () => {

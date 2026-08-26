@@ -23,6 +23,29 @@ the tests that raise it. A removal then surfaces as a conflict between the numbe
 than as silence. The census also rejects a duplicated test name, which is the other way a mistargeted
 insert lands.
 
+## The refusal notification
+
+`src/announce.ts` builds the text a person reads. It takes a detail level and the fields of one verdict,
+and returns a string. Every field it prints arrives as an argument, so each level is a string contract a
+unit test can hold whole. `test/announce.test.ts` pins every level with an exact string rather
+than a substring. A substring check cannot separate "carries less" from "carries more", and that is the
+only difference between the levels.
+
+`explainVerdict` in `src/gate.ts` builds the agent's payload, and no level here reaches it. Trimming a
+tool error to spare a person's attention would take fields from the reader who has to act on the refusal.
+
+The levels are cumulative, so each one begins with the text of the level below it, and the suite asserts
+that rather than trusting it. Two fields reach `debug` and nowhere else, because neither appears in the
+payload: the stage that decided, and the rule that matched. The rule line names the file it came from,
+which is the origin `/autoclassifier config` reports for that list.
+
+`verdictDetail` is a manifest enum. The Settings TUI renders it as a submenu, persists the value and
+validates it. Only that path gets the check. A hand-edited lockfile, `plugin-overrides.json` or
+`autoclassifier.yml` reaches `acceptScalar` directly, where the type check accepts any string at all.
+`ENUM_VALUES` in `src/config.ts` therefore mirrors the manifest `values`, the way `NUMBER_BOUNDS` mirrors
+`min` and `max`. A rejected value leaves the lower-precedence winner in place and adds a warning that
+`/autoclassifier config` prints.
+
 ## Calibration
 
 `tools/calibrate.ts` holds a matrix of transcripts. Each one pairs what the user asked for with what the

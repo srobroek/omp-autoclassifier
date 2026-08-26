@@ -48,8 +48,8 @@ beforeEach(resetTemperatureSupport);
 
 function deps(overrides: Partial<ClassifierDeps> = {}): ClassifierDeps {
 	return {
-		configuredRole: () => "test/cheap-1",
-		resolveModel: () => ({ provider: "test", id: "cheap-1" }),
+		configuredRole: () => "bedrock-mantle/openai.gpt-5.6-luna",
+		resolveModel: () => ({ provider: "bedrock-mantle", id: "openai.gpt-5.6-luna" }),
 		resolveAuth: async () => ({ ok: true, apiKey: "k", headers: { "x-test": "1" } }),
 		complete: fakeCompletion(["0"]).fn,
 		...overrides,
@@ -108,7 +108,7 @@ describe("configuration", () => {
 			deps({
 				resolveModel: spec => {
 					asked.push(spec);
-					return { provider: "test", id: "cheap-1" };
+					return { provider: "bedrock-mantle", id: "openai.gpt-5.6-luna" };
 				},
 			}),
 			evidence,
@@ -525,7 +525,7 @@ describe("stage two", () => {
 		await classify(
 			deps({ complete: fake.fn }),
 			{ ...evidence, environment: ["RULESLINE from config."] },
-			{ ...timeouts, steering: [{ pattern: "*cheap-1*", stage2: ["MODELLINE for this model."] }] },
+			{ ...timeouts, steering: [{ pattern: "*gpt-5.6-luna*", stage2: ["MODELLINE for this model."] }] },
 		);
 		const review = fake.calls[1]?.systemPrompt.join("\n") ?? "";
 		expect(review).toContain("MODELLINE");
@@ -540,6 +540,75 @@ describe("stage two", () => {
 			steering: [{ pattern: "*some-other-model*", stage2: ["MODELLINE."] }],
 		});
 		expect(fake.calls[1]?.systemPrompt.join("\n")).not.toContain("MODELLINE");
+	});
+});
+
+/**
+ * The allowlist is enforced here, not only in the setup wizard. A user may never run setup, may hand-edit
+ * `modelRoles`, or may carry a role configured before the allowlist existed — the account this was built on
+ * carried exactly that. Every one of those paths reaches `classify`, and none of them reaches the wizard.
+ */
+describe("only a tested model may review", () => {
+	test("an untested model is refused before any provider call", async () => {
+		const fake = fakeCompletion(["0"]);
+		const result = await classify(
+			deps({
+				configuredRole: () => "bedrock-mantle/openai.gpt-5.6-sol",
+				resolveModel: () => ({ provider: "bedrock-mantle", id: "openai.gpt-5.6-sol" }),
+				complete: fake.fn,
+			}),
+			evidence,
+			timeouts,
+		);
+		if (result.kind !== "failure") throw new Error(`expected a failure, got ${result.kind}`);
+		expect(result.reason).toContain("openai.gpt-5.6-sol");
+		// Refused on identity, so the gate never pays for a verdict it would not have trusted.
+		expect(fake.calls).toEqual([]);
+	});
+
+	/**
+	 * `failure`, never `unconfigured`. Unconfigured allows the call through as an opt-out; a misconfigured
+	 * reviewer must block instead, or pointing the role at an unmeasured model would silently disable the
+	 * gate while the status line still claimed it was armed.
+	 */
+	test("an untested model fails rather than reading as an opt-out", async () => {
+		const result = await classify(
+			deps({
+				configuredRole: () => "amazon-bedrock/global.anthropic.claude-opus-5",
+				resolveModel: () => ({ provider: "amazon-bedrock", id: "global.anthropic.claude-opus-5" }),
+			}),
+			evidence,
+			timeouts,
+		);
+		expect(result.kind).toBe("failure");
+	});
+
+	/** An undated alias of a measured release is refused too: the vendor may repoint it. */
+	test("a floating alias of a tested release is refused", async () => {
+		const result = await classify(
+			deps({
+				configuredRole: () => "anthropic/claude-haiku-4-5",
+				resolveModel: () => ({ provider: "anthropic", id: "claude-haiku-4-5" }),
+			}),
+			evidence,
+			timeouts,
+		);
+		expect(result.kind).toBe("failure");
+	});
+
+	test("the measured haiku is accepted through cross-region inference", async () => {
+		const result = await classify(
+			deps({
+				configuredRole: () => "amazon-bedrock/eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+				resolveModel: () => ({
+					provider: "amazon-bedrock",
+					id: "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+				}),
+			}),
+			evidence,
+			timeouts,
+		);
+		expect(result.kind).toBe("allow");
 	});
 });
 
@@ -634,6 +703,43 @@ describe("failing closed", () => {
 			{ stage1TimeoutMs: 30, stage2TimeoutMs: 30 },
 		);
 		expect(result.kind).toBe("failure");
+	});
+});
+
+/**
+ * A live false positive: `bd create`, which appends an issue to a beads database inside the working tree,
+ * was classified `external` on the grounds that an issue tracker is shared infrastructure. It is ordinary
+ * local work, and the previous wording invited that read by naming "shared infrastructure" without saying
+ * where the boundary is.
+ */
+describe("the external boundary", () => {
+	test("the policy requires a state change beyond this machine", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","reason":"x"}']);
+		await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		expect(fake.calls[1]?.systemPrompt.join("\n") ?? "").toContain("change of state beyond this machine");
+	});
+
+	/**
+	 * The second false positive from the same wording: the tuning harness was refused because it "sends
+	 * requests to external model services". Under that reading every model call is external, including the
+	 * classifier's own, so the gate would refuse the work it exists to supervise.
+	 */
+	test("consulting a model over the network is not an external effect", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","reason":"x"}']);
+		await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		const policy = fake.calls[1]?.systemPrompt.join("\n") ?? "";
+		expect(policy).toContain("reading or computing over the network is not an external effect");
+		// Exfiltration keeps its own category, so the carve-out cannot be read as permitting it.
+		expect(policy).toContain("sending private data out is `credentials`");
+	});
+
+	test("the policy names a tracker in the working tree as local", async () => {
+		const fake = fakeCompletion(["1", '{"decision":"allow","reason":"x"}']);
+		await classify(deps({ complete: fake.fn }), evidence, timeouts);
+		const review = fake.calls[1]?.systemPrompt.join("\n") ?? "";
+		expect(review).toContain("issue tracker inside the working tree is local work");
+		// The reason the clause exists: a teammate reading it later does not make the write external.
+		expect(review).toContain("even when other people will read it later");
 	});
 });
 

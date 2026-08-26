@@ -30,6 +30,7 @@ import {
 	type RuleLists,
 	SCALAR_DEFAULTS,
 	type Scalars,
+	VERDICT_DETAIL_LEVELS,
 } from "./defaults";
 import { type CompiledRules, compileRules, expandDefaults } from "./rules";
 
@@ -74,6 +75,17 @@ const NUMBER_BOUNDS: Partial<Record<ScalarKey, Bound>> = {
 	maxConsecutiveDenials: { min: 1 },
 	maxTotalDenials: { min: 1 },
 	cacheSize: { min: 0 },
+};
+
+/**
+ * Mirrors the `values` declared in the manifest, for the same reason `NUMBER_BOUNDS` mirrors `min`/`max`.
+ *
+ * omp checks an enum when its own Settings UI writes one, and nothing else goes through that check: a
+ * hand-edited lockfile, `plugin-overrides.json`, or YAML reaches here directly, where the type check alone
+ * accepts any string at all. A misspelled level would then read as a level.
+ */
+const ENUM_VALUES: Partial<Record<ScalarKey, readonly string[]>> = {
+	verdictDetail: VERDICT_DETAIL_LEVELS,
 };
 
 const SCALAR_KEYS = Object.keys(SCALAR_DEFAULTS) as ScalarKey[];
@@ -193,7 +205,7 @@ function message(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-/** Type-check and range-check one scalar. Rejected values keep the lower-precedence winner. */
+/** Type-check, range-check, and enum-check one scalar. Rejected values keep the lower-precedence winner. */
 function acceptScalar(key: ScalarKey, raw: unknown, origin: string, warnings: string[]): boolean {
 	const expected = typeof SCALAR_DEFAULTS[key];
 	if (typeof raw !== expected) {
@@ -212,6 +224,13 @@ function acceptScalar(key: ScalarKey, raw: unknown, origin: string, warnings: st
 		}
 		if (bound?.max !== undefined && raw > bound.max) {
 			warnings.push(`${origin} sets ${key} to ${raw}, above the maximum of ${bound.max}; ignored.`);
+			return false;
+		}
+	}
+	if (typeof raw === "string") {
+		const allowed = ENUM_VALUES[key];
+		if (allowed !== undefined && !allowed.includes(raw)) {
+			warnings.push(`${origin} sets ${key} to ${JSON.stringify(raw)}, not one of ${allowed.join(", ")}; ignored.`);
 			return false;
 		}
 	}

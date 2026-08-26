@@ -494,6 +494,12 @@ const configMutations: Mutation[] = [
 		to: "\t\t\tundefined ??",
 		expect: "evidence limits default and can be overridden",
 	},
+	{
+		name: "an enum value is type-checked but never value-checked",
+		from: "\t\tif (allowed !== undefined && !allowed.includes(raw)) {",
+		to: "\t\tif (allowed !== undefined && false) {",
+		expect: "an unknown enum value is ignored and reported",
+	},
 ];
 
 const evidenceMutations: Mutation[] = [
@@ -798,16 +804,26 @@ const stateMutations: Mutation[] = [
 		expect: "an allowed call between denials clears the run",
 	},
 	{
-		name: "the consecutive run never trips the breaker",
-		from: "\t\tif (this.#consecutiveFailures >= this.#thresholds.maxConsecutiveDenials) this.#paused = true;",
+		name: "the consecutive run never degrades the gate",
+		from: "\t\tif (this.#consecutiveFailures >= this.#thresholds.maxConsecutiveDenials) this.#degraded = true;",
 		to: "",
-		expect: "run of consecutive failures pauses",
+		expect: "run of consecutive failures degrades",
 	},
 	{
-		name: "the session total never trips the breaker",
-		from: "\t\tif (this.#totalFailures >= this.#thresholds.maxTotalDenials) this.#paused = true;",
+		name: "the session total never degrades the gate",
+		from: "\t\tif (this.#totalFailures >= this.#thresholds.maxTotalDenials) this.#degraded = true;",
 		to: "",
-		expect: "scattered failures still pause",
+		expect: "scattered failures still degrade",
+	},
+	{
+		/**
+		 * The regression a review caught before it shipped: a run of classifier failures set the user's own
+		 * bypass, which allows. A gate that opens when its reviewer breaks is not fail-closed.
+		 */
+		name: "a broken reviewer opens the gate instead of degrading it",
+		from: "if (this.#consecutiveFailures >= this.#thresholds.maxConsecutiveDenials) this.#degraded = true;",
+		to: "if (this.#consecutiveFailures >= this.#thresholds.maxConsecutiveDenials) this.#paused = true;",
+		expect: "degrades the gate rather than opening it",
 	},
 	{
 		name: "an allow clears the session total as well as the run",
@@ -819,13 +835,20 @@ const stateMutations: Mutation[] = [
 		name: "classifier failures bypass the breaker",
 		from: "\t\tthis.#totalFailures++;",
 		to: "",
-		expect: "scattered failures still pause",
+		expect: "scattered failures still degrade",
 	},
 	{
 		name: "resume leaves the counters in place",
 		from: "\t\tthis.#denied = 0;\n\t\tthis.#consecutiveDenials = 0;\n\t\tthis.#degradedReason = undefined;",
 		to: "",
-		expect: "resume re-arms the gate and clears both counters",
+		expect: "resume re-arms the gate",
+	},
+	{
+		/** Resume is the only exit from `degraded`, since a blocked call never produces an allow. */
+		name: "resume leaves the gate degraded",
+		from: "\t\tthis.#degraded = false;",
+		to: "",
+		expect: "resume clears the degraded state",
 	},
 	{
 		name: "an allow silently re-arms a paused gate",
@@ -846,10 +869,10 @@ const stateMutations: Mutation[] = [
 		expect: "notice fires once per session",
 	},
 	{
-		name: "the paused flag is not persisted",
-		from: '\t\tif (typeof record.paused === "boolean") this.#paused = record.paused;',
+		name: "the degraded flag is not persisted",
+		from: '\t\tif (typeof record.degraded === "boolean") this.#degraded = record.degraded;',
 		to: "",
-		expect: "paused gate stays paused after restore",
+		expect: "degraded gate stays degraded after restore",
 	},
 	{
 		name: "malformed persisted state is trusted",
@@ -1040,9 +1063,9 @@ const gateMutations: Mutation[] = [
 		expect: "classifier that throws blocks",
 	},
 	{
-		name: "the degraded notice repeats on every call",
-		from: "\t\t\tdeps.notify(announceVerdict(toolName, input, \"\", `the risk classifier is unreachable (${verdict.reason})`), \"error\");",
-		to: "",
+		name: "the degraded notice stops reaching the user",
+		from: "\t\t\t\t\t`the risk classifier is unreachable (${verdict.reason})`,",
+		to: '\t\t\t\t\t"",',
 		expect: "announces every call it blocks",
 	},
 	{
@@ -1311,97 +1334,99 @@ const logMutations: Mutation[] = [
 	},
 ];
 
+/**
+ * The allowlist decides which model may review a tool call, so every mutation here is a way the gate could
+ * silently accept an unmeasured reviewer.
+ */
+const modelsMutations: Mutation[] = [
+	{
+		name: "the provider no longer decides the grammar",
+		from: "\t\tif (!rule.provider.test(model.provider)) continue;",
+		to: "",
+		expect: "an unknown provider is refused even with a pinned id",
+	},
+	{
+		/** The pin: an undated alias may be repointed to weights nobody measured here. */
+		name: "the release date is no longer pinned on bedrock",
+		from: "anthropic\\.${HAIKU}-${HAIKU_DATE}-${REVISION}$",
+		to: "anthropic\\.${HAIKU}",
+		expect: "a different release date is refused",
+	},
+	{
+		name: "the anthropic date becomes optional again",
+		from: "^${HAIKU}-${HAIKU_DATE}$",
+		to: "^${HAIKU}(?:-${HAIKU_DATE})?$",
+		expect: "an undated alias is refused",
+	},
+	{
+		name: "cross-region prefixes stop being recognised",
+		from: "(?:(?:us|eu|jp|au|us-gov|global)\\.)?",
+		to: "",
+		expect: "cross-region inference",
+	},
+	{
+		/** `us-gov` carries a hyphen, so a two-letter class silently refuses a legitimate route. */
+		name: "the region class stops matching hyphenated regions",
+		from: "(?:us|eu|jp|au|us-gov|global)",
+		to: "(?:[a-z]{2}|global)",
+		expect: "us-gov cross-region inference",
+	},
+	{
+		name: "anchoring is dropped so a routing variant matches",
+		from: "^openai\\.${LUNA}$",
+		to: "openai\\.${LUNA}",
+		expect: "a routing variant is not the tested model",
+	},
+	{
+		/** Stripping any colon tail swallows OpenRouter's `:free`, which routes to a different upstream. */
+		name: "every colon suffix is stripped, not just a thinking level",
+		from: "const THINKING_SUFFIX = /:(?:auto|minimal|low|medium|high|xhigh|max)$/;",
+		to: "const THINKING_SUFFIX = /:[a-z]+$/;",
+		expect: "an openrouter routing variant is refused",
+	},
+	{
+		name: "the thinking suffix stops being stripped at all",
+		from: "\tconst id = model.id.replace(THINKING_SUFFIX, \"\");",
+		to: "\tconst id = model.id;",
+		expect: "a thinking suffix does not disqualify a tested model",
+	},
+	{
+		name: "an untested role is reported without naming the alternatives",
+		from: "(${TESTED_MODEL_NAMES.join(\", \")})",
+		to: "",
+		expect: "names both releases and the next step",
+	},
+];
+
 const wizardMutations: Mutation[] = [
 	{
-		name: "a disqualified model is no longer demoted",
-		from: "	if (MEASURED_WORST.some(pattern => pattern.test(model.id) || pattern.test(model.name))) {",
-		to: "	if (false) {",
-		expect: "disqualified is ranked below an unknown one",
-	},
-	{
-		name: "the demotion no longer short-circuits ahead of the cheap-role promotion",
-		from: "		return MEASURED_BEST.length + 4;",
-		to: "		void model;",
-		expect: "not promoted by a cheap role either",
-	},
-	{
-		name: "unsupported families are offered again",
-		from: "	const offered = supported.length > 0 ? supported : models;",
-		to: "	const offered = models;",
-		expect: "only anthropic and openai models are offered",
-	},
-	{
-		name: "an account with no supported family gets an empty picker",
-		from: "	const offered = supported.length > 0 ? supported : models;",
-		to: "	const offered = supported;",
-		expect: "rather than an empty picker",
-	},
-	{
-		/** Without this, cheapness wins again and the wizard recommends the leakiest model measured. */
-		name: "measurement no longer outranks cheapness",
-		from: "\tif (measured !== -1) return measured;",
+		/**
+		 * The replaced ranking was a pile of heuristics — cheap-sounding names, the user's own `smol` role, a
+		 * penalty for siblings of the session model — because the picker could offer anything. It can now
+		 * offer only two measured releases, so the heuristics and their mutations went together.
+		 */
+		name: "untested models are offered again",
+		from: "\t\t.filter(model => isTestedModel(model))",
 		to: "",
-		expect: "measured model outranks the user own cheap role",
+		expect: "only tested releases are offered",
 	},
 	{
-		name: "a model already trusted for cheap work is not preferred",
-		from: "\t\tif (configured !== undefined && roleNames(configured, model)) return MEASURED_BEST.length;",
+		name: "the measured order is discarded",
+		from: "\t\t.sort((a, b) => a.rank - b.rank)",
 		to: "",
-		expect: "trusted for cheap work is offered first",
+		expect: "haiku is offered before luna",
 	},
 	{
-		name: "only the smol role counts",
-		from: 'const CHEAP_ROLES = ["smol", "tiny"];',
-		to: 'const CHEAP_ROLES = ["smol"];',
-		expect: "tiny role counts as trusted",
+		name: "luna is ranked ahead of haiku",
+		from: "rank: TESTED_MODEL_NAMES.indexOf(testedModel(model)!)",
+		to: "rank: -TESTED_MODEL_NAMES.indexOf(testedModel(model)!)",
+		expect: "haiku is offered before luna",
 	},
 	{
-		name: "a thinking suffix defeats role matching",
-		from: "\tconst withoutSuffix = value.split(\":\")[0] ?? value;",
-		to: "\tconst withoutSuffix = value;",
-		expect: "thinking suffix still matches",
-	},
-	{
-		name: "a bare id in a role no longer matches",
-		from: "\treturn withoutSuffix === `${model.provider}/${model.id}` || withoutSuffix === model.id;",
-		to: "\treturn withoutSuffix === `${model.provider}/${model.id}`;",
-		expect: "bare id still matches",
-	},
-	{
-		name: "cheap naming conventions are not recognized",
-		from: "\tlet rank = MEASURED_BEST.length + (CHEAP_NAME.test(model.id) || CHEAP_NAME.test(model.name) ? 1 : 2);",
-		to: "\tlet rank = MEASURED_BEST.length + 2;",
-		expect: "cheap naming convention is recognized",
-	},
-	{
-		name: "the session model is offered as its own classifier",
-		from: "\t\tif (current.id === model.id && current.provider === model.provider) return rank + 2;",
-		to: "",
-		expect: "never the top suggestion",
-	},
-	{
-		name: "an expensive sibling is not penalized",
-		from: "\t\t\t\tif (options.family(current) === options.family(model)) rank += 1;",
-		to: "",
-		expect: "expensive sibling of the session model is pushed down",
-	},
-	{
-		name: "a throwing family lookup breaks ranking",
-		from: "\t\t\t} catch {",
-		to: "\t\t\t} finally {\n\t\t\t}\n\t\t\tif (false) {",
-		expect: "family function that throws",
-	},
-	{
-		name: "ranking is unstable for equal candidates",
-		from: "\t\t.sort((a, b) => a.score - b.score || a.index - b.index)",
-		to: "\t\t.sort((a, b) => a.score - b.score || b.index - a.index)",
-		expect: "stable for equally ranked models",
-	},
-	{
-		name: "candidates are dropped rather than ranked",
-		from: "\t\t.map(entry => entry.model);",
-		to: "\t\t.map(entry => entry.model)\n\t\t.slice(0, 1);",
-		expect: "every model is offered",
+		name: "the picker no longer names the route",
+		from: "\treturn `${model.provider}/${model.id}`;",
+		to: "\treturn model.id;",
+		expect: "described by provider and id",
 	},
 ];
 
@@ -1555,6 +1580,133 @@ const steeringMutations: Mutation[] = [
 	},
 ];
 
+/**
+ * `src/announce.ts` builds the notification a person reads. The levels differ only by which fields they
+ * carry, so every mutation here either moves a field to the wrong level or drops one from its own.
+ */
+const announceMutations: Mutation[] = [
+	{
+		name: "minimal falls through to the audited line",
+		from: "\tif (level === \"minimal\") return line(head);",
+		to: "\tif (level === \"minimal\" && false) return line(head);",
+		expect: "minimal carries neither the reason nor the axes",
+	},
+	{
+		name: "the target never reaches the headline",
+		from: "\tconst target = present(input.target);",
+		to: "\tconst target = undefined;",
+		expect: "minimal names the call and stops there",
+	},
+	{
+		name: "a category that names no harm is printed anyway",
+		from: "\tconst named = category === undefined || UNNAMED_CATEGORIES[category] === true ? \"\" : ` (${category})`;",
+		to: "\tconst named = category === undefined ? \"\" : ` (${category})`;",
+		expect: "an unnamed category is left out of the line",
+	},
+	{
+		name: "the category drops off the line entirely",
+		from: "\tconst named = category === undefined || UNNAMED_CATEGORIES[category] === true ? \"\" : ` (${category})`;",
+		to: "\tconst named = \"\";",
+		expect: "normal adds the category and the model's sentence",
+	},
+	{
+		name: "the axes drop off the audited line",
+		from: "\tconst audited = line(`${summary} ${dimensions(input)}`);",
+		to: "\tconst audited = line(summary);",
+		expect: "verbose adds the axes a refusal is audited on",
+	},
+	{
+		name: "the injection flag leaves the axes",
+		from: "; injection: ${injection}]`;",
+		to: "]`;",
+		expect: "verbose states the injection flag even when nothing was suspected",
+	},
+	{
+		name: "an axis nobody stated prints as an empty label",
+		from: "\treturn present(value) ?? \"unstated\";",
+		to: "\treturn value;",
+		expect: "an axis the caller could not fill reads as unstated",
+	},
+	{
+		name: "a suspected injection reads like a clean one",
+		from: "\tconst injection = input.injectionSuspected ? \"suspected\" : \"none\";",
+		to: "\tconst injection = \"none\";",
+		expect: "verbose says so when the evidence tried to authorize the call",
+	},
+	{
+		name: "debug is treated as verbose",
+		from: "\tif (level !== \"debug\") return audited;",
+		to: "\tif (level !== \"debugging\") return audited;",
+		expect: "only debug carries the payload the agent received",
+	},
+	{
+		name: "the payload rides along at verbose",
+		from: "\tif (level !== \"debug\") return audited;",
+		to: "\tif (level !== \"debug\") return [audited, ...provenance(input)].join(\"\\n\");",
+		expect: "verbose carries no payload and no provenance",
+	},
+	{
+		name: "an unrecognised level lands on debug",
+		from: "\tif (level !== \"debug\") return audited;",
+		to: "\tif (level === \"verbose\") return audited;",
+		expect: "an unrecognised level does not reproduce the payload",
+	},
+	{
+		name: "the two stages are named alike",
+		from: "\tif (stage === 1) return \"stage 1 (filter)\";",
+		to: "\tif (stage === 1) return \"stage 2 (review)\";",
+		expect: "debug adds the stage that decided",
+	},
+	{
+		name: "a rule block is credited to a stage anyway",
+		from: "\tif (stage !== undefined) out.push(`decided by: ${stage}`);",
+		to: "\tout.push(`decided by: stage ${input.stage}`);",
+		expect: "a rule block with no stage prints no decided-by line",
+	},
+	{
+		name: "a stage the classifier never reports is given a name",
+		from: "\treturn undefined;\n}",
+		to: "\treturn `stage ${stage}`;\n}",
+		expect: "a stage the classifier never reports prints no line at all",
+	},
+	{
+		name: "an origin with no rule prints a rule line",
+		from: "\tif (rule !== undefined) out.push(",
+		to: "\tif (rule !== undefined || from !== undefined) out.push(",
+		expect: "an origin without a rule prints no rule line",
+	},
+	{
+		name: "a missing payload prints its label anyway",
+		from: "\tif (present(input.agentPayload) !== undefined) out.push(",
+		to: "\tif (input.agentPayload !== null) out.push(",
+		expect: "a refusal with no payload prints no payload label",
+	},
+	{
+		name: "the payload is collapsed like a notification line",
+		from: "out.push(`agent payload:\\n${input.agentPayload}`);",
+		to: "out.push(line(`agent payload:\\n${input.agentPayload}`));",
+		expect: "debug reproduces the payload the agent received verbatim",
+	},
+	{
+		name: "the debug fields join onto the summary line",
+		from: "\treturn [audited, ...provenance(input)].join(\"\\n\");",
+		to: "\treturn [audited, ...provenance(input)].join(\" \");",
+		expect: "debug keeps the summary and the axes on its first line",
+	},
+	{
+		name: "a whitespace-only field reads as a value",
+		from: "\treturn collapsed === \"\" ? undefined : collapsed;",
+		to: "\treturn collapsed === \"\\u0000\" ? undefined : collapsed;",
+		expect: "a call with no reportable target reads without a dangling on",
+	},
+	{
+		name: "the notification keeps the newlines it was handed",
+		from: "\treturn text.replace(/\\s+/g, \" \").trim();",
+		to: "\treturn text.trim();",
+		expect: "verbose stays one line when the reason and the target span several",
+	},
+];
+
 const groups: Group[] = [
 	{ target: "src/rules.ts", testFile: "test/rules.test.ts", mutations: rulesMutations },
 	{ target: "src/defaults.ts", testFile: "test/rules.test.ts", mutations: defaultsMutations },
@@ -1569,6 +1721,8 @@ const groups: Group[] = [
 	{ target: "src/wizard.ts", testFile: "test/wizard.test.ts", mutations: wizardMutations },
 	{ target: "src/command.ts", testFile: "test/command.test.ts", mutations: commandMutations },
 	{ target: "src/steering.ts", testFile: "test/steering.test.ts", mutations: steeringMutations },
+	{ target: "src/announce.ts", testFile: "test/announce.test.ts", mutations: announceMutations },
+	{ target: "src/models.ts", testFile: "test/models.test.ts", mutations: modelsMutations },
 ];
 
 let gaps = 0;

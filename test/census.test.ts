@@ -19,8 +19,13 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-/** Raise this with the commit that adds tests. Never lower it to make a red suite green. */
-const FLOOR = 478;
+/**
+ * Raise this with the commit that adds tests. Never lower it to make a red suite green.
+ *
+ * This counts `test(` literals, which is fewer than the suite reports at runtime: several files generate
+ * cases from a table in a loop, and one literal there stands for a dozen assertions.
+ */
+const FLOOR = 516;
 
 const DIRECTORY = path.dirname(import.meta.path);
 /** Excluded from its own census, so adding a check here does not inflate the number it guards. */
