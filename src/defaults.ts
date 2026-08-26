@@ -84,15 +84,53 @@ export const DEFAULT_HARD_DENY: readonly string[] = Object.freeze([
 	"edit(<agentDir>/config.yml)",
 	"write(<agentDir>/settings.json)",
 	"edit(<agentDir>/settings.json)",
-	"write(<pluginsRoot>/*)",
-	"edit(<pluginsRoot>/*)",
+	// This plugin's own installed files, not every plugin's. `<pluginsRoot>/*` hard-denied edits to every
+	// package a user had installed, so touching an unrelated plugin was refused with a reason about
+	// anti-tamper for this one.
+	"write(<pluginsRoot>/*omp-autoclassifier*)",
+	"edit(<pluginsRoot>/*omp-autoclassifier*)",
 	"write(<cwd>/.omp/plugin-overrides.json)",
 	"edit(<cwd>/.omp/plugin-overrides.json)",
 	"bash(*omp plugin disable*)",
 	"bash(*omp plugin config set*autoclassifier*)",
 	"bash(*omp config set*disabledExtensions*)",
-	"bash(*autoclassifier.yml*)",
-	"eval(*autoclassifier*)",
+	// Writes to the gate's own config, not reads of it. `bash(*autoclassifier.yml*)` refused
+	// `omp plugin config get`, a yaml lint, a diff and a checksum, all of which a user needs in order to see
+	// what the gate is doing.
+	//
+	// These name mutating shapes rather than every possible one, and a verb list is not a boundary: a shell
+	// has more ways to write a file than any list holds. What makes that acceptable is the layer behind it.
+	// A shape absent here reaches the review stage, which reads the whole command and every link of it, so
+	// the gap costs a model call rather than the protection.
+	//
+	// `cp` and `install` take the path in either position, and only the destination is a write. Their
+	// patterns end at the filename so that copying the config out to a backup stays a read.
+	"bash(*>*autoclassifier.yml*)",
+	"bash(*tee*autoclassifier.yml*)",
+	"bash(*sed -i*autoclassifier.yml*)",
+	"bash(*rm *autoclassifier.yml*)",
+	"bash(*mv *autoclassifier.yml*)",
+	"bash(*cp *autoclassifier.yml)",
+	"bash(*install *autoclassifier.yml)",
+	"bash(*truncate*autoclassifier.yml*)",
+	// `eval` runs arbitrary code, so no pattern over its text is a boundary either. It gets the same
+	// treatment as `bash` for the same reason: a broad `eval(*autoclassifier*)` refused reading the config as
+	// well as writing it, and reading it is how a user finds out what the gate does.
+	//
+	// The verbs cover the prelude's `write`, Node's `writeFileSync`, `appendFile`, `unlink`, `rename`,
+	// `rmSync` and `truncate`, `Bun.write`, and Python's `open` in a writing mode. The mode is matched with
+	// its opening quote, because a bare letter is not specific enough: `*a*` after a path matches the `a` in
+	// a session id, so a read of `sessions/abc/session.jsonl` would have tripped an append rule.
+	"eval(*write*autoclassifier*)",
+	"eval(*append*autoclassifier*)",
+	"eval(*unlink*autoclassifier*)",
+	"eval(*rename*autoclassifier*)",
+	"eval(*rmSync*autoclassifier*)",
+	"eval(*truncate*autoclassifier*)",
+	"eval(*open*autoclassifier*'w*)",
+	"eval(*open*autoclassifier*\"w*)",
+	"eval(*open*autoclassifier*'a*)",
+	"eval(*open*autoclassifier*\"a*)",
 	// A transcript is the authorization record a resumed session reads back, so a line shaped like a user
 	// message becomes user intent for that session's reviews.
 	//
@@ -102,11 +140,31 @@ export const DEFAULT_HARD_DENY: readonly string[] = Object.freeze([
 	// as much: a tampered entry "feeds every later classification once the session is resumed". The threat
 	// is deferred rather than live, which is why it earns a pattern here and no change to the review.
 	//
-	// Writes only. Reading a transcript is ordinary work, and omp's own history tooling depends on it.
+	// Writes only, and the bash and eval patterns now match that sentence. `bash(*<agentDir>/sessions*)` and
+	// `eval(*<agentDir>/sessions*)` blocked every read as well, including the `jq` and `wc` that omp's own
+	// history tooling runs.
+	//
+	// `cp` is absent here, unlike on the config above. A transcript filename varies, so no glob can say the
+	// path is the destination rather than the source, and a pattern that tried refused copying a transcript
+	// out for inspection. Copying one in reaches the review stage instead.
 	"write(<agentDir>/sessions/*)",
 	"edit(<agentDir>/sessions/*)",
-	"bash(*<agentDir>/sessions*)",
-	"eval(*<agentDir>/sessions*)",
+	"bash(*>*<agentDir>/sessions*)",
+	"bash(*tee*<agentDir>/sessions*)",
+	"bash(*sed -i*<agentDir>/sessions*)",
+	"bash(*rm *<agentDir>/sessions*)",
+	"bash(*mv *<agentDir>/sessions*)",
+	"bash(*truncate*<agentDir>/sessions*)",
+	"eval(*write*<agentDir>/sessions*)",
+	"eval(*append*<agentDir>/sessions*)",
+	"eval(*unlink*<agentDir>/sessions*)",
+	"eval(*rename*<agentDir>/sessions*)",
+	"eval(*rmSync*<agentDir>/sessions*)",
+	"eval(*truncate*<agentDir>/sessions*)",
+	"eval(*open*<agentDir>/sessions*'w*)",
+	"eval(*open*<agentDir>/sessions*\"w*)",
+	"eval(*open*<agentDir>/sessions*'a*)",
+	"eval(*open*<agentDir>/sessions*\"a*)",
 ]);
 
 /**

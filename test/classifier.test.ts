@@ -525,7 +525,7 @@ describe("stage two", () => {
 		await classify(
 			deps({ complete: fake.fn }),
 			{ ...evidence, environment: ["RULESLINE from config."] },
-			{ ...timeouts, steering: [{ pattern: /cheap-1/, stage2: ["MODELLINE for this model."] }] },
+			{ ...timeouts, steering: [{ pattern: "*cheap-1*", stage2: ["MODELLINE for this model."] }] },
 		);
 		const review = fake.calls[1]?.systemPrompt.join("\n") ?? "";
 		expect(review).toContain("MODELLINE");
@@ -537,7 +537,7 @@ describe("stage two", () => {
 		const fake = fakeCompletion(["1", '{"decision":"allow","reason":"x"}']);
 		await classify(deps({ complete: fake.fn }), evidence, {
 			...timeouts,
-			steering: [{ pattern: /some-other-model/, stage2: ["MODELLINE."] }],
+			steering: [{ pattern: "*some-other-model*", stage2: ["MODELLINE."] }],
 		});
 		expect(fake.calls[1]?.systemPrompt.join("\n")).not.toContain("MODELLINE");
 	});

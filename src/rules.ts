@@ -176,7 +176,12 @@ export function remoteTargets(input: unknown): string[] {
 	return pathFields(input).filter(target => REMOTE_SCHEME_RE.test(target));
 }
 
-function globToRegExp(pattern: string): RegExp {
+/**
+ * A rule glob as a regex: `*` spans anything, every other character is literal, and the whole string has to
+ * match. Exported because the per-model steering table matches model ids the same way, and a model id carries
+ * a region prefix that differs per account.
+ */
+export function globToRegExp(pattern: string): RegExp {
 	let out = "";
 	for (const ch of pattern) {
 		out += ch === "*" ? "[\\s\\S]*" : ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

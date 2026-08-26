@@ -7,16 +7,22 @@
  * hole a review found. Forking it per model leaves a hole closed for one model open in the others, with
  * nothing to report the divergence. A bounded addition keeps one policy and still lets a model that reads
  * it badly be corrected.
- *
- * What earns an entry here. A clause belongs to a model, not to the policy, when it was measured on that
- * model and on the model this gate recommends, and it moved the first without costing the second. Generic
- * strictness does not qualify: four escalating levels were measured on `claude-haiku-4-5` and moved nothing
- * at all, 1 escape and 8 held calls across every arm, while the same levels on `gpt-5.6-luna` traded about
- * one held call per escape removed. A clause that buys escapes with refusals is a preference, not a fix.
  */
+import { globToRegExp } from "./rules";
+
 export interface ModelSteering {
-	/** Matched against the resolved model id. Must not carry the `g` flag; see `steeringFor`. */
-	pattern: RegExp;
+	/**
+	 * A rule glob matched against the resolved model id, in the same syntax the rule lists use.
+	 *
+	 * A glob rather than a regex, because a model id carries a region prefix that differs per account. The
+	 * same Haiku resolves to `au.anthropic.claude-haiku-4-5-20251001-v1:0` on one account and to a `global.`
+	 * or `us.` spelling on another, so `*anthropic.claude-haiku-4-5*` is the identity a reader means. An
+	 * anchored literal would silently miss every account but the one it was written on.
+	 *
+	 * Globs also remove a hazard the regex form carried: a caller-supplied `/g` pattern kept `lastIndex`
+	 * between calls, so the same model matched and then missed.
+	 */
+	pattern: string;
 	/** Lines appended to the filter prompt, which has sixteen tokens and answers one character. */
 	stage1?: readonly string[];
 	/** Lines appended to the review prompt, ahead of the user's rules and the schema. */
@@ -55,12 +61,20 @@ export interface ModelSteering {
  */
 export const MODEL_STEERING: readonly ModelSteering[] = Object.freeze([]);
 
+/** Compiled globs, keyed by pattern text. A table entry is compiled once however many calls read it. */
+const compiled = new Map<string, RegExp>();
+
+function matcher(pattern: string): RegExp {
+	const hit = compiled.get(pattern);
+	if (hit !== undefined) return hit;
+	const made = globToRegExp(pattern);
+	compiled.set(pattern, made);
+	return made;
+}
+
 /**
- * Every steering line that applies to `modelId`, split by stage. Entries accumulate, so a family-wide
- * pattern and a model-specific one both apply.
- *
- * `lastIndex` is reset before each test. A caller passing a `g`-flagged pattern would otherwise get
- * alternating answers for the same model, which is a bug this project has already shipped once.
+ * Every steering line that applies to `modelId`, split by stage. Entries accumulate, so a family-wide glob
+ * and a model-specific one both apply.
  */
 export function steeringFor(
 	modelId: string,
@@ -69,8 +83,7 @@ export function steeringFor(
 	const stage1: string[] = [];
 	const stage2: string[] = [];
 	for (const entry of table) {
-		entry.pattern.lastIndex = 0;
-		if (!entry.pattern.test(modelId)) continue;
+		if (!matcher(entry.pattern).test(modelId)) continue;
 		if (entry.stage1 !== undefined) stage1.push(...entry.stage1);
 		if (entry.stage2 !== undefined) stage2.push(...entry.stage2);
 	}

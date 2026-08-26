@@ -452,6 +452,139 @@ describe("shipped defaults", () => {
 	});
 
 	/**
+	 * The anti-tamper list guards writes to the gate's own settings. It was also refusing every read of
+	 * them, so a user could not see what the gate was doing without tripping it.
+	 *
+	 * `bash(*autoclassifier.yml*)` matched the whole command string, so `omp plugin config get`, a yaml
+	 * lint, a diff and a checksum were all hard denied with a reason about tampering.
+	 */
+	test("reading the gate's own config is ordinary work", () => {
+		for (const command of [
+			"omp plugin config get omp-autoclassifier enabled",
+			`yamllint ${vars.agentDir}/autoclassifier.yml`,
+			`diff -u ${vars.agentDir}/autoclassifier.yml ${vars.cwd}/.omp/autoclassifier.yml`,
+			`shasum -a 256 ${vars.agentDir}/autoclassifier.yml`,
+			`wc -l ${vars.agentDir}/autoclassifier.yml`,
+		]) {
+			expect(decide("bash", { command })).toBeUndefined();
+		}
+	});
+
+	/**
+	 * `cp` and `install` take the protected path in either position, and only the destination is a write.
+	 * `bash(*cp *autoclassifier.yml*)` matched both, so backing the config up was refused as tampering.
+	 */
+	test("copying the gate's own config out is a read", () => {
+		for (const command of [
+			`cp ${vars.agentDir}/autoclassifier.yml /tmp/backup.yml`,
+			`cp ${vars.agentDir}/autoclassifier.yml ${vars.cwd}/notes/config-snapshot.yml`,
+			`install -m 644 ${vars.agentDir}/autoclassifier.yml /tmp/backup.yml`,
+		]) {
+			expect(decide("bash", { command })).toBeUndefined();
+		}
+	});
+
+	/**
+	 * A transcript filename varies, so no glob can say the path is a destination rather than a source. The
+	 * config above can, because its name is fixed. Copying a transcript in reaches the review stage.
+	 */
+	test("copying a session transcript out is a read", () => {
+		expect(decide("bash", { command: `cp ${vars.agentDir}/sessions/p/one.jsonl /tmp/one.jsonl` })).toBeUndefined();
+	});
+
+	/**
+	 * `eval` ran arbitrary code, so an earlier `eval(*autoclassifier*)` was left broad on the argument that no
+	 * pattern over its text is a boundary. True, and it is equally true of `bash`, which does not get a broad
+	 * pattern. The cost fell on reads: inspecting the gate's own config from `eval` was refused as tampering.
+	 */
+	test("reading the gate's own config from eval is ordinary work", () => {
+		for (const code of [
+			`const cfg = read('${vars.agentDir}/autoclassifier.yml'); display(cfg)`,
+			`console.log(require('fs').readFileSync('${vars.agentDir}/autoclassifier.yml', 'utf8'))`,
+			`const text = await Bun.file('${vars.agentDir}/autoclassifier.yml').text()`,
+		]) {
+			expect(decide("eval", { code })).toBeUndefined();
+		}
+	});
+
+	test("writing the gate's own config from eval is still refused", () => {
+		for (const code of [
+			`write('${vars.agentDir}/autoclassifier.yml', 'rules: {}')`,
+			`require('fs').writeFileSync('${vars.agentDir}/autoclassifier.yml', 'x')`,
+			`require('fs').appendFileSync('${vars.agentDir}/autoclassifier.yml', 'x')`,
+			`require('fs').unlinkSync('${vars.agentDir}/autoclassifier.yml')`,
+			`require('fs').renameSync('/tmp/x', '${vars.agentDir}/autoclassifier.yml')`,
+			`require('fs').rmSync('${vars.agentDir}/autoclassifier.yml')`,
+			`await Bun.write('${vars.agentDir}/autoclassifier.yml', 'x')`,
+		]) {
+			expect(decide("eval", { code })).toBe("hardDeny");
+		}
+	});
+
+	test("reading a session transcript from eval is ordinary work", () => {
+		expect(decide("eval", { code: `read('${vars.agentDir}/sessions/p/one.jsonl')` })).toBeUndefined();
+		expect(decide("eval", { code: `write('${vars.agentDir}/sessions/p/one.jsonl', 'x')` })).toBe("hardDeny");
+	});
+
+	/** Reading an installed plugin's own source is how a user audits it. */
+	test("reading this plugin's installed files is ordinary work", () => {
+		expect(decide("read", { path: `${vars.pluginsRoot}/omp-autoclassifier/src/gate.ts` })).toBe("allow");
+		expect(decide("bash", { command: `wc -l ${vars.pluginsRoot}/omp-autoclassifier/src/gate.ts` })).toBeUndefined();
+		expect(decide("bash", { command: `diff -u ${vars.pluginsRoot}/omp-autoclassifier/src/gate.ts /tmp/gate.ts` })).toBeUndefined();
+	});
+
+	test("writing the gate's own config is still refused", () => {
+		for (const command of [
+			`echo 'rules: {}' > ${vars.agentDir}/autoclassifier.yml`,
+			`echo 'rules: {}' | tee ${vars.agentDir}/autoclassifier.yml`,
+			`sed -i 's/true/false/' ${vars.agentDir}/autoclassifier.yml`,
+			`mv /tmp/x.yml ${vars.agentDir}/autoclassifier.yml`,
+			`cp /tmp/x.yml ${vars.agentDir}/autoclassifier.yml`,
+			`truncate -s 0 ${vars.agentDir}/autoclassifier.yml`,
+		]) {
+			expect(decide("bash", { command })).toBe("hardDeny");
+		}
+	});
+
+	/**
+	 * The comment above the transcript patterns says "writes only", and the bash pattern did not agree with
+	 * it: `bash(*<agentDir>/sessions*)` refused the `jq` and `wc` that omp's own history tooling runs.
+	 */
+	test("reading a session transcript is ordinary work", () => {
+		for (const command of [
+			`jq -r '.type' ${vars.agentDir}/sessions/p/one.jsonl`,
+			`wc -l ${vars.agentDir}/sessions/p/one.jsonl`,
+			`grep -c title ${vars.agentDir}/sessions/p/one.jsonl`,
+		]) {
+			expect(decide("bash", { command })).toBeUndefined();
+		}
+	});
+
+	test("writing a session transcript is still refused", () => {
+		for (const command of [
+			`echo '{"role":"user"}' >> ${vars.agentDir}/sessions/p/one.jsonl`,
+			`sed -i '$d' ${vars.agentDir}/sessions/p/one.jsonl`,
+			`truncate -s 0 ${vars.agentDir}/sessions/p/one.jsonl`,
+		]) {
+			expect(decide("bash", { command })).toBe("hardDeny");
+		}
+		expect(decide("write", { path: `${vars.agentDir}/sessions/p/one.jsonl`, content: "x" })).toBe("hardDeny");
+	});
+
+	/**
+	 * `write(<pluginsRoot>/*)` guarded this plugin by refusing edits to every plugin a user had installed,
+	 * so an unrelated package could not be touched without a reason about this gate's anti-tamper.
+	 */
+	test("only this plugin's own files are protected", () => {
+		expect(decide("edit", { path: `${vars.pluginsRoot}/omp-autoclassifier/src/gate.ts` })).toBe("hardDeny");
+		expect(decide("write", { path: `${vars.pluginsRoot}/node_modules/omp-autoclassifier/package.json`, content: "{}" })).toBe(
+			"hardDeny",
+		);
+		expect(decide("edit", { path: `${vars.pluginsRoot}/omp-something-else/src/index.ts` })).toBeUndefined();
+		expect(decide("write", { path: `${vars.pluginsRoot}/node_modules/other-plugin/index.ts`, content: "x" })).toBeUndefined();
+	});
+
+	/**
 	 * A rule fires before the classifier, so anything listed here loses the model's reading of the
 	 * transcript. That is why `push --force` is absent: the classifier allows it when the user asked for it,
 	 * and a rule could only take that judgement away.

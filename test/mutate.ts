@@ -30,6 +30,72 @@ interface Group {
  */
 const defaultsMutations: Mutation[] = [
 	{
+		name: "eval anti-tamper matches reads again",
+		from: "\t\"eval(*write*autoclassifier*)\",",
+		to: "\t\"eval(*autoclassifier*)\",",
+		expect: "reading the gate's own config from eval is ordinary work",
+	},
+	{
+		name: "an eval write verb drops off the list",
+		from: "\t\"eval(*append*autoclassifier*)\",",
+		to: "\t\"eval(*appendXX*autoclassifier*)\",",
+		expect: "writing the gate's own config from eval is still refused",
+	},
+	{
+		name: "a python write mode is no longer recognised",
+		from: "\t\"eval(*open*autoclassifier*'w*)\",",
+		to: "\t\"eval(*openXX*autoclassifier*'w*)\",",
+		expect: "eval is treated as shell-equivalent for anti-tamper",
+	},
+	{
+		name: "the copy rule matches the config in source position",
+		from: "\t\"bash(*cp *autoclassifier.yml)\",",
+		to: "\t\"bash(*cp *autoclassifier.yml*)\",",
+		expect: "copying the gate's own config out is a read",
+	},
+	{
+		name: "the install rule matches the config in source position",
+		from: "\t\"bash(*install *autoclassifier.yml)\",",
+		to: "\t\"bash(*install *autoclassifier.yml*)\",",
+		expect: "copying the gate's own config out is a read",
+	},
+	{
+		name: "the config anti-tamper rule matches reads again",
+		from: '	"bash(*>*autoclassifier.yml*)",',
+		to: '	"bash(*autoclassifier.yml*)",',
+		expect: "reading the gate's own config is ordinary work",
+	},
+	{
+		name: "a write verb drops off the config anti-tamper list",
+		from: '	"bash(*tee*autoclassifier.yml*)",',
+		to: '	"bash(*teerXX*autoclassifier.yml*)",',
+		expect: "writing the gate's own config is still refused",
+	},
+	{
+		name: "the transcript anti-tamper rule matches reads again",
+		from: '	"bash(*>*<agentDir>/sessions*)",',
+		to: '	"bash(*<agentDir>/sessions*)",',
+		expect: "reading a session transcript is ordinary work",
+	},
+	{
+		name: "a write verb drops off the transcript anti-tamper list",
+		from: '	"bash(*truncate*<agentDir>/sessions*)",',
+		to: '	"bash(*truncateXX*<agentDir>/sessions*)",',
+		expect: "writing a session transcript is still refused",
+	},
+	{
+		name: "anti-tamper widens to every installed plugin",
+		from: '	"write(<pluginsRoot>/*omp-autoclassifier*)",',
+		to: '	"write(<pluginsRoot>/*)",',
+		expect: "only this plugin's own files are protected",
+	},
+	{
+		name: "this plugin's own installed files stop being protected",
+		from: '	"edit(<pluginsRoot>/*omp-autoclassifier*)",',
+		to: '	"edit(<pluginsRoot>/*omp-autoclassifier-none*)",',
+		expect: "only this plugin's own files are protected",
+	},
+	{
 		/** The allowlist hole the calibration matrix caught, credited to \`rule read\` with no model call. */
 		name: "secret stores go back to the read fast path",
 		from: '	"read(<home>/.ssh/*_rsa)",',
@@ -1453,15 +1519,15 @@ const commandMutations: Mutation[] = [
 const steeringMutations: Mutation[] = [
 	{
 		name: "every entry applies regardless of the model",
-		from: "\t\tif (!entry.pattern.test(modelId)) continue;",
-		to: "\t\tif (false) continue;",
+		from: "		if (!matcher(entry.pattern).test(modelId)) continue;",
+		to: "		if (false) continue;",
 		expect: "a non-matching entry never contributes",
 	},
 	{
-		name: "a global pattern is no longer reset, so the same model matches then misses",
-		from: "\t\tentry.pattern.lastIndex = 0;",
-		to: "",
-		expect: "answers the same way every time",
+		name: "the compiled glob cache returns a match for every pattern",
+		from: "	const hit = compiled.get(pattern);",
+		to: "	const hit = compiled.values().next().value;",
+		expect: "a non-matching entry never contributes",
 	},
 	{
 		name: "filter lines are delivered to the review stage",
