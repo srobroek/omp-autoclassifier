@@ -46,7 +46,7 @@ jobs:
 
       # npm performs the publish, so it needs a Node toolchain new enough for
       # OIDC trusted publishing (npm >= 11.5.1, shipped with Node >= 22.14).
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
