@@ -36,7 +36,7 @@ jobs:
       # short-lived credential, so no long-lived NPM_TOKEN exists anywhere.
       id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
