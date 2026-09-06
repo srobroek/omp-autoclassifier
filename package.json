@@ -135,7 +135,7 @@
 	},
 	"devDependencies": {
 		"@types/bun": "^1.4.0",
-		"omp-host": "npm:@oh-my-pi/pi-coding-agent@18.0.4",
+		"omp-host": "npm:@oh-my-pi/pi-coding-agent@18.1.12",
 		"omp-host-ai": "npm:@oh-my-pi/pi-ai@18.0.4",
 		"typescript": "^7.0.2"
 	},
