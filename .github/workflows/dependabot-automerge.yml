@@ -1,0 +1,63 @@
+name: Dependabot automerge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  automerge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable OMP patch automerge
+        if: >-
+          github.actor == 'dependabot[bot]' &&
+          steps.metadata.outputs.package-ecosystem == 'bun' &&
+          steps.metadata.outputs.dependency-group == 'omp-patch' &&
+          steps.metadata.outputs.update-type == 'version-update:semver-patch'
+        env:
+          DEPENDENCY_NAMES: ${{ steps.metadata.outputs.dependency-names }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          is_allowed_omp_dependency() {
+            case "$1" in
+              @oh-my-pi/pi-ai|@oh-my-pi/pi-coding-agent|@oh-my-pi/pi-utils|omp-host|omp-host-ai)
+                return 0
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          matched=0
+          while IFS= read -r dependency; do
+            dependency="${dependency#"${dependency%%[![:space:]]*}"}"
+            dependency="${dependency%"${dependency##*[![:space:]]}"}"
+            [[ -n "$dependency" ]] || continue
+            if ! is_allowed_omp_dependency "$dependency"; then
+              echo "Refusing to automerge unexpected dependency: $dependency" >&2
+              exit 0
+            fi
+            matched=1
+          done < <(tr ',' '\n' <<< "$DEPENDENCY_NAMES")
+
+          (( matched == 1 )) || exit 0
+          gh pr merge --auto --squash "$PR_URL"

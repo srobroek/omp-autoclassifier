@@ -1,0 +1,122 @@
+name: OMP minor compatibility
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: omp-minor-compatibility
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Read direct OMP baseline
+        id: baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline="$(node -e '
+            const fs = require("node:fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            process.stdout.write(pkg.devDependencies?.["@oh-my-pi/pi-coding-agent"] ?? "");
+          ')"
+          if [[ ! "$baseline" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "The direct @oh-my-pi/pi-coding-agent baseline is missing or not an exact semver: $baseline" >&2
+            exit 1
+          fi
+          echo "version=$baseline" >> "$GITHUB_OUTPUT"
+
+      - name: Find a same-major greater-minor OMP release
+        id: candidate
+        env:
+          BASELINE: ${{ steps.baseline.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          versions_json="$(npm view @oh-my-pi/pi-coding-agent versions --json)"
+          export VERSIONS_JSON="$versions_json"
+          candidate="$(node -e '
+            const semver = /^(\d+)\.(\d+)\.(\d+)$/;
+            const baselineMatch = process.env.BASELINE.match(semver);
+            const baseline = baselineMatch.slice(1, 4).map(Number);
+            const versions = JSON.parse(process.env.VERSIONS_JSON);
+            const candidates = (Array.isArray(versions) ? versions : [versions])
+              .map(String)
+              .map(version => ({ version, match: version.match(semver) }))
+              .filter(({ match }) => match)
+              .map(({ version, match }) => ({ version, parts: match.slice(1, 4).map(Number) }))
+              .filter(({ parts }) => parts[0] === baseline[0] && parts[1] > baseline[1])
+              .sort((left, right) => left.parts[1] - right.parts[1] || left.parts[2] - right.parts[2]);
+            process.stdout.write(candidates.at(-1)?.version ?? "");
+          ')"
+          if [[ -z "$candidate" ]]; then
+            echo "No same-major greater-minor release is available than $BASELINE."
+            exit 0
+          fi
+          candidate_major="${candidate%%.*}"
+          candidate_minor="${candidate#*.}"
+          candidate_minor="${candidate_minor%%.*}"
+          {
+            echo "version=$candidate"
+            echo "major=$candidate_major"
+            echo "minor=$candidate_minor"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open a compatibility review issue
+        if: steps.candidate.outputs.version != ''
+        env:
+          BASELINE: ${{ steps.baseline.outputs.version }}
+          CANDIDATE: ${{ steps.candidate.outputs.version }}
+          CANDIDATE_MAJOR: ${{ steps.candidate.outputs.major }}
+          CANDIDATE_MINOR: ${{ steps.candidate.outputs.minor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          title="Review OMP ${CANDIDATE_MAJOR}.${CANDIDATE_MINOR} compatibility"
+          body="A same-major OMP minor release (${CANDIDATE}) is newer than the direct baseline (${BASELINE}). Review and test compatibility before updating this repository."
+
+          if ! issues_json="$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/issues?state=all&per_page=100")"; then
+            echo "Unable to enumerate all open and closed issues; refusing to create a duplicate-risk issue." >&2
+            exit 1
+          fi
+
+          if ! duplicate="$(jq -r --arg title "$title" '
+            (add) as $issues
+            | if ($issues | type) != "array" then
+                error("GitHub issues response was not a paginated array")
+              else
+                any($issues[]; .title == $title)
+              end
+          ' <<< "$issues_json")"; then
+            echo "Unable to validate the all-state issue response; refusing to create an issue." >&2
+            exit 1
+          fi
+
+          case "$duplicate" in
+            true)
+              echo "An issue with the exact title already exists: $title"
+              exit 0
+              ;;
+            false)
+              ;;
+            *)
+              echo "Unexpected dedupe result: $duplicate" >&2
+              exit 1
+              ;;
+          esac
+
+          gh issue create --title "$title" --body "$body"
