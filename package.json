@@ -137,7 +137,7 @@
 		"@oh-my-pi/pi-ai": "18.2.1",
 		"@oh-my-pi/pi-coding-agent": "18.2.1",
 		"@oh-my-pi/pi-utils": "18.2.1",
-		"@types/bun": "^1.4.0",
+		"@types/bun": "^1.4.2",
 		"omp-host": "npm:@oh-my-pi/pi-coding-agent@18.2.1",
 		"omp-host-ai": "npm:@oh-my-pi/pi-ai@18.2.1",
 		"typescript": "^7.0.2"
