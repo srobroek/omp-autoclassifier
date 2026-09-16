@@ -18,5 +18,5 @@
 			"@oh-my-pi/pi-ai": ["./node_modules/omp-host-ai"]
 		}
 	},
-	"include": ["src", "test", "tools/calibrate.ts", "tools/tune-extension.ts"]
+	"include": ["src", "test", "tools/calibrate.ts", "tools/tune-extension.ts", "tools/validate-omp-dependabot.ts"]
 }

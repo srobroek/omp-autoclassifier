@@ -1,0 +1,117 @@
+name: Dependabot automerge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  automerge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check out trusted workflow files
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Validate exact PR-head dependency files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_path="$RUNNER_TEMP/package.json"
+          lock_path="$RUNNER_TEMP/bun.lock"
+          gh api "repos/$REPOSITORY/contents/package.json?ref=$HEAD_SHA" --jq .content | base64 --decode > "$package_path"
+          gh api "repos/$REPOSITORY/contents/bun.lock?ref=$HEAD_SHA" --jq .content | base64 --decode > "$lock_path"
+          bun tools/validate-omp-dependabot.ts "$package_path" "$lock_path"
+
+      - name: Wait for successful exact-head CI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          max_attempts=18
+          attempt=1
+          while (( attempt <= max_attempts )); do
+            checks_json="$(gh api "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?per_page=100")"
+            if jq -e --arg sha "$HEAD_SHA" '[.check_runs[] | select(.name == "check" and .head_sha == $sha and .conclusion == "success")] | length > 0' <<< "$checks_json" >/dev/null; then
+              exit 0
+            fi
+            if jq -e --arg sha "$HEAD_SHA" '[.check_runs[] | select(.name == "check" and .head_sha == $sha and (.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required" or .conclusion == "stale"))] | length > 0' <<< "$checks_json" >/dev/null; then
+              echo "Refusing to automerge after failed check CI on exact PR head $HEAD_SHA" >&2
+              exit 1
+            fi
+            if (( attempt == max_attempts )); then
+              echo "Timed out waiting for successful check CI on exact PR head $HEAD_SHA" >&2
+              exit 1
+            fi
+            sleep 10
+            (( attempt++ ))
+          done
+
+
+      - name: Enable OMP patch automerge
+        if: >-
+          github.actor == 'dependabot[bot]' &&
+          steps.metadata.outputs.package-ecosystem == 'bun' &&
+          steps.metadata.outputs.dependency-group == 'omp-patch' &&
+          steps.metadata.outputs.update-type == 'version-update:semver-patch'
+        env:
+          DEPENDENCY_NAMES: ${{ steps.metadata.outputs.dependency-names }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          is_allowed_omp_dependency() {
+            case "$1" in
+              @oh-my-pi/pi-ai|@oh-my-pi/pi-coding-agent|@oh-my-pi/pi-utils|omp-host|omp-host-ai)
+                return 0
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          matched=0
+          while IFS= read -r dependency; do
+            dependency="${dependency#"${dependency%%[![:space:]]*}"}"
+            dependency="${dependency%"${dependency##*[![:space:]]}"}"
+            [[ -n "$dependency" ]] || continue
+            if ! is_allowed_omp_dependency "$dependency"; then
+              echo "Refusing to automerge unexpected dependency: $dependency" >&2
+              exit 0
+            fi
+            matched=1
+          done < <(tr ',' '\n' <<< "$DEPENDENCY_NAMES")
+
+          (( matched == 1 )) || exit 0
+          pr_json="$(gh pr view "$PR_URL" --json state,headRefOid)"
+          if [[ "$(jq -r .state <<< "$pr_json")" != open || "$(jq -r .headRefOid <<< "$pr_json")" != "$HEAD_SHA" ]]; then
+            echo "Refusing to automerge: PR is no longer open at exact head $HEAD_SHA" >&2
+            exit 1
+          fi
+          gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"

@@ -1,0 +1,37 @@
+version: 2
+updates:
+  - package-ecosystem: bun
+    directory: /
+    schedule:
+      interval: daily
+    groups:
+      omp-patch:
+        patterns:
+          - "@oh-my-pi/pi-ai"
+          - "@oh-my-pi/pi-coding-agent"
+          - "@oh-my-pi/pi-utils"
+          - "omp-host"
+          - "omp-host-ai"
+        update-types:
+          - patch
+    ignore:
+      - dependency-name: "@oh-my-pi/pi-ai"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
+      - dependency-name: "@oh-my-pi/pi-coding-agent"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
+      - dependency-name: "@oh-my-pi/pi-utils"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
+      - dependency-name: "omp-host"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
+      - dependency-name: "omp-host-ai"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
