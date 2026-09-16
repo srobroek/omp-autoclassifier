@@ -20,6 +20,9 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
+
+      - name: Dependabot dependency policy tests
+        run: bun run test:dependabot
       - name: Typecheck
         run: bun run check
 
